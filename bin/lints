@@ -1,0 +1,941 @@
+#!/usr/bin/env python3
+"""lints: Centralised Ruff + Oxlint config sync and runner across machines."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import platform
+import plistlib
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO_DIR = Path(__file__).resolve().parent.parent
+CACHE_DIR = Path.home() / ".cache" / "lints"
+STATUS_FILE = CACHE_DIR / "status.json"
+LOCK_FILE = CACHE_DIR / "sync.lock"
+LOG_FILE = CACHE_DIR / "sync.log"
+
+LAUNCHD_LABEL = "com.lints.sync"
+LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+SYSTEMD_DIR = Path.home() / ".config" / "systemd" / "user"
+SYSTEMD_SERVICE = SYSTEMD_DIR / "lints-sync.service"
+SYSTEMD_TIMER = SYSTEMD_DIR / "lints-sync.timer"
+CRON_MARKER = "# lints-auto-sync"
+
+PY_EXTS = {".py", ".pyi"}
+TS_EXTS = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts", ".cjs", ".cts"}
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    "out",
+    "target",
+    ".mypy_cache",
+    ".ruff_cache",
+}
+
+
+def ensure_rich_path() -> str:
+    home = str(Path.home())
+    extra = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        f"{home}/.local/bin",
+        f"{home}/.bun/bin",
+        f"{home}/.cargo/bin",
+    ]
+    current = os.environ.get("PATH", "/usr/bin:/bin")
+    merged = list(dict.fromkeys([*extra, *current.split(":")]))
+    new_path = ":".join(p for p in merged if p)
+    os.environ["PATH"] = new_path
+    return new_path
+
+
+def run(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    check: bool = True,
+    capture: bool = False,
+    timeout: int | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        check=check,
+        text=True,
+        capture_output=capture,
+        timeout=timeout,
+        env=env,
+    )
+
+
+def resolve_ruff_cmd() -> list[str] | None:
+    if shutil.which("ruff"):
+        return ["ruff"]
+    if shutil.which("uvx"):
+        return ["uvx", "ruff"]
+    return None
+
+
+def resolve_oxlint_cmd() -> list[str] | None:
+    if shutil.which("oxlint"):
+        return ["oxlint"]
+    if shutil.which("bunx"):
+        return ["bunx", "oxlint"]
+    if shutil.which("npx"):
+        return ["npx", "--yes", "oxlint"]
+    return None
+
+
+def managed_symlinks() -> list[tuple[Path, Path]]:
+    home = Path.home()
+    return [
+        (home / ".config" / "ruff" / "ruff.toml", REPO_DIR / "ruff.toml"),
+        (home / "oxlint.config.mts", REPO_DIR / "oxlint.config.mts"),
+        (home / ".local" / "bin" / "lints", REPO_DIR / "bin" / "lints"),
+    ]
+
+
+def ensure_symlink(link_path: Path, target_path: Path) -> str:
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    if link_path.is_symlink():
+        if link_path.resolve() == target_path.resolve():
+            return "unchanged"
+        link_path.unlink()
+    elif link_path.exists():
+        stamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
+        backup = link_path.with_name(f"{link_path.name}.bak.{stamp}")
+        link_path.rename(backup)
+        print(f"  backed up existing {link_path} -> {backup}")
+    link_path.symlink_to(target_path)
+    return "linked"
+
+
+def current_branch() -> str:
+    res = run(
+        ["git", "symbolic-ref", "--short", "HEAD"],
+        cwd=REPO_DIR,
+        check=False,
+        capture=True,
+    )
+    return res.stdout.strip() or "main"
+
+
+def has_remote_origin() -> bool:
+    res = run(
+        ["git", "remote", "get-url", "origin"],
+        cwd=REPO_DIR,
+        check=False,
+        capture=True,
+    )
+    return res.returncode == 0 and bool(res.stdout.strip())
+
+
+def non_interactive_git_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
+    return env
+
+
+def git_in_rebase_or_merge() -> bool:
+    res = run(
+        ["git", "rev-parse", "--git-dir"],
+        cwd=REPO_DIR,
+        check=False,
+        capture=True,
+    )
+    if res.returncode != 0:
+        return False
+    git_dir = (REPO_DIR / res.stdout.strip()).resolve()
+    markers = ("rebase-merge", "rebase-apply", "MERGE_HEAD")
+    return any((git_dir / m).exists() for m in markers)
+
+
+def is_python_script(path: Path) -> bool:
+    ext = path.suffix.lower()
+    if ext in PY_EXTS:
+        return True
+    if ext:
+        return False
+    try:
+        with path.open("rb") as fh:
+            first_line = fh.readline(128)
+        return first_line.startswith(b"#!") and b"python" in first_line
+    except OSError:
+        return False
+
+
+def detect_languages(targets: list[str]) -> tuple[bool, bool]:
+    has_py = False
+    has_ts = False
+    for raw in targets:
+        p = Path(raw)
+        if p.is_file():
+            ext = p.suffix.lower()
+            has_py = has_py or is_python_script(p)
+            has_ts = has_ts or (ext in TS_EXTS)
+        elif p.is_dir():
+            for root, dirs, files in os.walk(p):
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                root_path = Path(root)
+                for fname in files:
+                    ext = Path(fname).suffix.lower()
+                    if ext in PY_EXTS or (not ext and is_python_script(root_path / fname)):
+                        has_py = True
+                    elif ext in TS_EXTS:
+                        has_ts = True
+                    if has_py and has_ts:
+                        return True, True
+    return has_py, has_ts
+
+
+def has_local_ruff_config(start: Path) -> bool:
+    cur = start.resolve()
+    if cur.is_file():
+        cur = cur.parent
+    home = Path.home().resolve()
+    while True:
+        if (cur / "ruff.toml").exists() or (cur / ".ruff.toml").exists():
+            return True
+        pyproject = cur / "pyproject.toml"
+        if pyproject.exists():
+            try:
+                if "[tool.ruff" in pyproject.read_text(encoding="utf-8", errors="ignore"):
+                    return True
+            except OSError:
+                pass
+        if cur == home or cur.parent == cur:
+            break
+        cur = cur.parent
+    xdg_ruff = home / ".config" / "ruff" / "ruff.toml"
+    return xdg_ruff.exists()
+
+
+def has_local_oxlint_config(start: Path) -> bool:
+    cur = start.resolve()
+    if cur.is_file():
+        cur = cur.parent
+    names = (".oxlintrc.json", ".oxlintrc.jsonc", "oxlint.config.ts", "oxlint.config.mts")
+    while True:
+        if any((cur / n).exists() for n in names):
+            return True
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return False
+
+
+def ruff_config_args(targets: list[str]) -> list[str]:
+    probe = Path(targets[0]) if targets else Path.cwd()
+    if has_local_ruff_config(probe):
+        return []
+    return ["--config", str(REPO_DIR / "ruff.toml")]
+
+
+def oxlint_config_args(targets: list[str]) -> list[str]:
+    probe = Path(targets[0]) if targets else Path.cwd()
+    if has_local_oxlint_config(probe):
+        return []
+    return ["-c", str(REPO_DIR / "oxlint.config.mts")]
+
+
+def cmd_ruff_check(args: argparse.Namespace) -> int:
+    ruff = resolve_ruff_cmd()
+    if not ruff:
+        print("error: ruff not found (run `lints bootstrap` or install uv/ruff)", file=sys.stderr)
+        return 1
+    targets = args.paths or ["."]
+    res = run([*ruff, "check", *ruff_config_args(targets), *targets], check=False)
+    return res.returncode
+
+
+def cmd_oxlint_check(args: argparse.Namespace) -> int:
+    oxlint = resolve_oxlint_cmd()
+    if not oxlint:
+        print(
+            "error: oxlint not found (run `lints bootstrap` or install bun/node/oxlint)",
+            file=sys.stderr,
+        )
+        return 1
+    targets = args.paths or ["."]
+    res = run([*oxlint, *oxlint_config_args(targets), *targets], check=False)
+    return res.returncode
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    targets = args.paths or ["."]
+    has_py, has_ts = detect_languages(targets)
+    if not has_py and not has_ts:
+        print("No Python or JS/TS files found to lint.")
+        return 0
+
+    exit_code = 0
+    if has_py:
+        ruff = resolve_ruff_cmd()
+        if not ruff:
+            print("error: ruff not found (run `lints bootstrap`)", file=sys.stderr)
+            exit_code = 1
+        else:
+            print("==> ruff check")
+            res = run([*ruff, "check", *ruff_config_args(targets), *targets], check=False)
+            if res.returncode != 0:
+                exit_code = res.returncode
+
+    if has_ts:
+        oxlint = resolve_oxlint_cmd()
+        if not oxlint:
+            print("error: oxlint not found (run `lints bootstrap`)", file=sys.stderr)
+            exit_code = 1
+        else:
+            print("==> oxlint")
+            res = run([*oxlint, *oxlint_config_args(targets), *targets], check=False)
+            if res.returncode != 0:
+                exit_code = res.returncode
+
+    return exit_code
+
+
+def cmd_fix(args: argparse.Namespace) -> int:
+    targets = args.paths or ["."]
+    has_py, has_ts = detect_languages(targets)
+    if not has_py and not has_ts:
+        print("No Python or JS/TS files found to fix.")
+        return 0
+
+    exit_code = 0
+    if has_py:
+        ruff = resolve_ruff_cmd()
+        if not ruff:
+            print("error: ruff not found (run `lints bootstrap`)", file=sys.stderr)
+            exit_code = 1
+        else:
+            cfg = ruff_config_args(targets)
+            print("==> ruff check --fix")
+            r1 = run([*ruff, "check", "--fix", *cfg, *targets], check=False)
+            print("==> ruff format")
+            r2 = run([*ruff, "format", *cfg, *targets], check=False)
+            if r1.returncode != 0 or r2.returncode != 0:
+                exit_code = r1.returncode or r2.returncode
+
+    if has_ts:
+        oxlint = resolve_oxlint_cmd()
+        if not oxlint:
+            print("error: oxlint not found (run `lints bootstrap`)", file=sys.stderr)
+            exit_code = 1
+        else:
+            print("==> oxlint --fix")
+            r3 = run([*oxlint, "--fix", *oxlint_config_args(targets), *targets], check=False)
+            if r3.returncode != 0:
+                exit_code = r3.returncode
+
+    return exit_code
+
+
+def validate_configs() -> bool:
+    base_json = REPO_DIR / "oxlint.base.json"
+    try:
+        json.loads(base_json.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"Validation failed: oxlint.base.json is invalid JSON: {exc}", file=sys.stderr)
+        return False
+
+    with tempfile.TemporaryDirectory(prefix="lints-validate-") as tmp:
+        tmp_path = Path(tmp)
+        sample_py = tmp_path / "sample.py"
+        sample_ts = tmp_path / "sample.ts"
+        sample_py.write_text("value = 1\n", encoding="utf-8")
+        sample_ts.write_text("export const value = 1;\n", encoding="utf-8")
+
+        ruff = resolve_ruff_cmd()
+        if ruff:
+            res = run(
+                [*ruff, "check", "--config", str(REPO_DIR / "ruff.toml"), str(sample_py)],
+                check=False,
+                capture=True,
+            )
+            if res.returncode != 0:
+                print("Validation failed for ruff.toml:", file=sys.stderr)
+                print(res.stderr or res.stdout, file=sys.stderr)
+                return False
+
+        oxlint = resolve_oxlint_cmd()
+        if oxlint:
+            res = run(
+                [*oxlint, "-c", str(REPO_DIR / "oxlint.config.mts"), str(sample_ts)],
+                check=False,
+                capture=True,
+            )
+            if res.returncode != 0:
+                print("Validation failed for oxlint.config.mts / plugins:", file=sys.stderr)
+                print(res.stderr or res.stdout, file=sys.stderr)
+                return False
+
+    print("Configs validated (ruff.toml + oxlint.base.json + plugins).")
+    return True
+
+
+def cmd_validate(_args: argparse.Namespace) -> int:
+    return 0 if validate_configs() else 1
+
+
+def install_tools(upgrade: bool = False) -> None:
+    if upgrade or not shutil.which("ruff"):
+        if shutil.which("uv"):
+            cmd = ["uv", "tool", "install", *(["--upgrade"] if upgrade else []), "ruff"]
+            print(f"==> {' '.join(cmd)}")
+            run(cmd, check=False)
+        else:
+            print("  note: `uv` not found; skipping global `ruff` install")
+
+    if upgrade or not shutil.which("oxlint"):
+        pkg = "oxlint@latest" if upgrade else "oxlint"
+        if shutil.which("bun"):
+            cmd = ["bun", "install", "-g", pkg]
+            print(f"==> {' '.join(cmd)}")
+            run(cmd, check=False)
+        elif shutil.which("npm"):
+            cmd = ["npm", "install", "-g", pkg]
+            print(f"==> {' '.join(cmd)}")
+            run(cmd, check=False)
+        else:
+            print("  note: neither `bun` nor `npm` found; skipping global `oxlint` install")
+
+
+def sync_pull(*, quiet: bool = False) -> tuple[bool, str]:
+    if not has_remote_origin():
+        return True, "no git remote `origin` configured yet"
+
+    if git_in_rebase_or_merge():
+        return False, "skipped: git rebase/merge in progress"
+
+    branch = current_branch()
+    env = non_interactive_git_env()
+
+    try:
+        fetch = run(
+            ["git", "fetch", "--quiet", "origin", branch],
+            cwd=REPO_DIR,
+            check=False,
+            capture=True,
+            timeout=15,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "fetch timed out"
+
+    if fetch.returncode != 0:
+        err = (fetch.stderr or fetch.stdout).strip().splitlines()
+        msg = err[0] if err else "git fetch failed"
+        return False, msg
+
+    # Check whether origin/<branch> has commits not in HEAD
+    anc = run(
+        ["git", "merge-base", "--is-ancestor", f"origin/{branch}", "HEAD"],
+        cwd=REPO_DIR,
+        check=False,
+        capture=True,
+    )
+    if anc.returncode == 0:
+        return True, "already up to date"
+
+    if not quiet:
+        print(f"==> Pulling latest lint rules from origin/{branch}...")
+
+    rebase = run(
+        ["git", "rebase", "--autostash", f"origin/{branch}"],
+        cwd=REPO_DIR,
+        check=False,
+        capture=True,
+        timeout=30,
+        env=env,
+    )
+    if rebase.returncode != 0:
+        run(["git", "rebase", "--abort"], cwd=REPO_DIR, check=False, capture=True)
+        err = (rebase.stderr or rebase.stdout).strip()
+        return False, f"rebase conflict aborted: {err}"
+
+    sha = run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=REPO_DIR,
+        check=False,
+        capture=True,
+    ).stdout.strip()
+    return True, f"updated to {sha}"
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    ok, msg = sync_pull(quiet=False)
+    if not ok:
+        print(f"error: {msg}", file=sys.stderr)
+        return 1
+    print(f"Sync: {msg}")
+    if args.tools:
+        install_tools(upgrade=True)
+    return 0
+
+
+def cmd_push(args: argparse.Namespace) -> int:
+    if not args.force and not validate_configs():
+        return 1
+
+    status = run(
+        ["git", "status", "--porcelain"],
+        cwd=REPO_DIR,
+        check=True,
+        capture=True,
+    ).stdout.strip()
+
+    if status:
+        run(["git", "add", "-A"], cwd=REPO_DIR)
+        msg = " ".join(args.message).strip() if args.message else ""
+        if not msg:
+            host = socket.gethostname().split(".")[0]
+            msg = f"chore: update lint rules ({host})"
+        run(["git", "commit", "-m", msg], cwd=REPO_DIR)
+    else:
+        print("Working tree clean; checking remote sync...")
+
+    if not has_remote_origin():
+        print("error: no `origin` remote configured in repo.", file=sys.stderr)
+        return 1
+
+    branch = current_branch()
+    ok, pull_msg = sync_pull(quiet=False)
+    if not ok:
+        print(f"error pulling before push: {pull_msg}", file=sys.stderr)
+        return 1
+
+    print(f"==> Pushing to origin/{branch}...")
+    push = run(["git", "push", "-u", "origin", branch], cwd=REPO_DIR, check=False)
+    if push.returncode == 0:
+        print("Pushed! Other machines running the `lints` daemon will sync within 60s.")
+    return push.returncode
+
+
+def write_tick_status(ok: bool, detail: str) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    sha = run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=REPO_DIR,
+        check=False,
+        capture=True,
+    ).stdout.strip()
+    payload = {
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),  # noqa: UP017
+        "ok": ok,
+        "detail": detail,
+        "commit": sha,
+    }
+    STATUS_FILE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def daemon_tick() -> int:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("w", encoding="utf-8") as lock_fh:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        ok, detail = sync_pull(quiet=True)
+        write_tick_status(ok, detail)
+        return 0 if ok else 1
+
+
+def install_daemon() -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    lints_bin = str(REPO_DIR / "bin" / "lints")
+    rich_path = ensure_rich_path()
+    sys_name = platform.system()
+
+    if sys_name == "Darwin":
+        LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
+        plist_data = {
+            "Label": LAUNCHD_LABEL,
+            "ProgramArguments": [sys.executable, lints_bin, "daemon", "tick"],
+            "StartInterval": 60,
+            "RunAtLoad": True,
+            "EnvironmentVariables": {
+                "PATH": rich_path,
+                "HOME": str(Path.home()),
+            },
+            "StandardOutPath": str(LOG_FILE),
+            "StandardErrorPath": str(LOG_FILE),
+        }
+        with LAUNCHD_PLIST.open("wb") as fh:
+            plistlib.dump(plist_data, fh)
+
+        uid = os.getuid()
+        run(
+            ["launchctl", "bootout", f"gui/{uid}", str(LAUNCHD_PLIST)],
+            check=False,
+            capture=True,
+        )
+        boot = run(
+            ["launchctl", "bootstrap", f"gui/{uid}", str(LAUNCHD_PLIST)],
+            check=False,
+            capture=True,
+        )
+        if boot.returncode != 0:
+            run(["launchctl", "load", "-w", str(LAUNCHD_PLIST)], check=False)
+        print(f"Installed 60s macOS launchd sync agent ({LAUNCHD_PLIST})")
+        return
+
+    # Linux: prefer systemd --user timer, fallback to crontab
+    if shutil.which("systemctl"):
+        check_user = run(["systemctl", "--user", "status"], check=False, capture=True)
+        if check_user.returncode in (0, 3):
+            SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
+            SYSTEMD_SERVICE.write_text(
+                "[Unit]\n"
+                "Description=Sync central lints repository\n\n"
+                "[Service]\n"
+                "Type=oneshot\n"
+                f'Environment="PATH={rich_path}"\n'
+                f"ExecStart={sys.executable} {lints_bin} daemon tick\n",
+                encoding="utf-8",
+            )
+            SYSTEMD_TIMER.write_text(
+                "[Unit]\n"
+                "Description=Run lints sync every minute\n\n"
+                "[Timer]\n"
+                "OnBootSec=15s\n"
+                "OnUnitActiveSec=60s\n"
+                "AccuracySec=5s\n\n"
+                "[Install]\n"
+                "WantedBy=timers.target\n",
+                encoding="utf-8",
+            )
+            run(["systemctl", "--user", "daemon-reload"], check=False)
+            run(["systemctl", "--user", "enable", "--now", "lints-sync.timer"], check=False)
+            print(f"Installed 60s systemd user timer ({SYSTEMD_TIMER})")
+            return
+
+    if shutil.which("crontab"):
+        existing = run(["crontab", "-l"], check=False, capture=True)
+        lines = [
+            ln
+            for ln in (existing.stdout if existing.returncode == 0 else "").splitlines()
+            if CRON_MARKER not in ln
+        ]
+        cron_line = (
+            f"* * * * * PATH={rich_path} {sys.executable} {lints_bin} daemon tick {CRON_MARKER}"
+        )
+        lines.append(cron_line)
+        proc = subprocess.run(
+            ["crontab", "-"],
+            input="\n".join(lines) + "\n",
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            print("Installed 60s crontab auto-sync entry.")
+            return
+
+    print("warning: could not configure background timer automatically on this OS.")
+
+
+def uninstall_daemon() -> None:
+    sys_name = platform.system()
+    if sys_name == "Darwin":
+        if LAUNCHD_PLIST.exists():
+            uid = os.getuid()
+            run(
+                ["launchctl", "bootout", f"gui/{uid}", str(LAUNCHD_PLIST)],
+                check=False,
+                capture=True,
+            )
+            LAUNCHD_PLIST.unlink(missing_ok=True)
+            print("Removed macOS launchd sync agent.")
+        else:
+            print("macOS launchd agent is not installed.")
+        return
+
+    if SYSTEMD_TIMER.exists() or SYSTEMD_SERVICE.exists():
+        run(["systemctl", "--user", "disable", "--now", "lints-sync.timer"], check=False)
+        SYSTEMD_TIMER.unlink(missing_ok=True)
+        SYSTEMD_SERVICE.unlink(missing_ok=True)
+        run(["systemctl", "--user", "daemon-reload"], check=False)
+        print("Removed systemd user timer.")
+
+    if shutil.which("crontab"):
+        existing = run(["crontab", "-l"], check=False, capture=True)
+        if existing.returncode == 0 and CRON_MARKER in existing.stdout:
+            kept = [ln for ln in existing.stdout.splitlines() if CRON_MARKER not in ln]
+            subprocess.run(
+                ["crontab", "-"],
+                input=("\n".join(kept) + "\n") if kept else "",
+                text=True,
+                check=False,
+            )
+            print("Removed crontab auto-sync entry.")
+
+
+def daemon_is_installed() -> tuple[bool, str]:
+    if platform.system() == "Darwin":
+        return (LAUNCHD_PLIST.exists(), f"launchd ({LAUNCHD_PLIST})")
+    if SYSTEMD_TIMER.exists():
+        return (True, f"systemd ({SYSTEMD_TIMER})")
+    if shutil.which("crontab"):
+        existing = run(["crontab", "-l"], check=False, capture=True)
+        if existing.returncode == 0 and CRON_MARKER in existing.stdout:
+            return (True, "crontab (* * * * *)")
+    return (False, "not installed")
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    action = args.action
+    if action == "tick":
+        return daemon_tick()
+    if action == "install":
+        install_daemon()
+        return 0
+    if action == "uninstall":
+        uninstall_daemon()
+        return 0
+    if action == "status":
+        installed, kind = daemon_is_installed()
+        print(f"Daemon: {'installed' if installed else 'not installed'} — {kind}")
+        if STATUS_FILE.exists():
+            data = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+            state = "ok" if data.get("ok") else "error"
+            print(
+                f"Last tick: {data.get('timestamp')} [{state}] "
+                f"({data.get('detail')}, commit {data.get('commit')})"
+            )
+        else:
+            print("Last tick: none recorded yet")
+        return 0
+    return 1
+
+
+def cmd_bootstrap(args: argparse.Namespace) -> int:
+    print(f"==> Linking central configs from {REPO_DIR}")
+    for link_path, target_path in managed_symlinks():
+        state = ensure_symlink(link_path, target_path)
+        print(f"  {link_path} -> {target_path} ({state})")
+
+    if not args.no_tools:
+        install_tools(upgrade=False)
+
+    if args.with_git_hook:
+        hooks_dir = REPO_DIR / "hooks"
+        run(["git", "config", "--global", "core.hooksPath", str(hooks_dir)])
+        print(f"==> Configured global Git hooksPath -> {hooks_dir}")
+
+    if not args.no_daemon:
+        install_daemon()
+        daemon_tick()
+
+    local_bin = str(Path.home() / ".local" / "bin")
+    if local_bin not in os.environ.get("PATH", "").split(":"):
+        print(f"\nnote: ensure `{local_bin}` is in your shell PATH.")
+    print("\nBootstrap complete! Run `lints status` anytime to verify.")
+    return 0
+
+
+def cmd_edit(args: argparse.Namespace) -> int:
+    mapping = {
+        "ruff": REPO_DIR / "ruff.toml",
+        "ts": REPO_DIR / "oxlint.base.json",
+        "oxlint": REPO_DIR / "oxlint.base.json",
+        "plugins": REPO_DIR / "plugins" / "custom.mjs",
+    }
+    target = mapping[args.target]
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not editor:
+        print(str(target))
+        return 0
+    return run([*editor.split(), str(target)], check=False).returncode
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    root_dir = Path(args.dir).expanduser().resolve()
+    config_names = {
+        "ruff.toml",
+        ".ruff.toml",
+        ".oxlintrc.json",
+        ".oxlintrc.jsonc",
+        "oxlint.config.ts",
+        "oxlint.config.mts",
+    }
+    found: list[Path] = []
+    for cur_root, dirs, files in os.walk(root_dir):
+        cur_path = Path(cur_root)
+        if cur_path == REPO_DIR or REPO_DIR in cur_path.parents:
+            dirs[:] = []
+            continue
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fname in files:
+            fpath = cur_path / fname
+            if fname in config_names:
+                found.append(fpath)
+            elif fname == "pyproject.toml":
+                try:
+                    if "[tool.ruff" in fpath.read_text(encoding="utf-8", errors="ignore"):
+                        found.append(fpath)
+                except OSError:
+                    pass
+
+    if not found:
+        print(f"No project-specific ruff/oxlint configs found under {root_dir}")
+        return 0
+
+    print(f"Found {len(found)} local linter config(s) under {root_dir}:")
+    for p in sorted(found):
+        print(f"  - {p}")
+    return 0
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    branch = current_branch()
+    sha = run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=REPO_DIR,
+        check=False,
+        capture=True,
+    ).stdout.strip()
+    dirty = bool(
+        run(
+            ["git", "status", "--porcelain"],
+            cwd=REPO_DIR,
+            check=False,
+            capture=True,
+        ).stdout.strip()
+    )
+    remote_url = run(
+        ["git", "remote", "get-url", "origin"],
+        cwd=REPO_DIR,
+        check=False,
+        capture=True,
+    ).stdout.strip()
+
+    print(f"Repo:      {REPO_DIR}")
+    print(f"Git:       {branch} @ {sha or 'uncommitted'} ({'dirty' if dirty else 'clean'})")
+    print(f"Remote:    {remote_url or 'none'}")
+
+    print("\nSymlinks:")
+    for link_path, target_path in managed_symlinks():
+        ok = link_path.is_symlink() and link_path.resolve() == target_path.resolve()
+        marker = "ok" if ok else "not linked"
+        print(f"  [{marker}] {link_path} -> {target_path}")
+
+    ruff = shutil.which("ruff") or ("uvx ruff" if shutil.which("uvx") else "missing")
+    oxlint = shutil.which("oxlint") or ("bunx oxlint" if shutil.which("bunx") else "missing")
+    print("\nLinters:")
+    print(f"  ruff:    {ruff}")
+    print(f"  oxlint:  {oxlint}")
+
+    print("")
+    cmd_daemon(argparse.Namespace(action="status"))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="lints",
+        description="Centralised Ruff + Oxlint configs & 1-minute cross-machine sync.",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    p_check = sub.add_parser("check", help="Run ruff + oxlint on target path(s)")
+    p_check.add_argument("paths", nargs="*", help="Files or directories (default: .)")
+    p_check.set_defaults(func=cmd_check)
+
+    p_fix = sub.add_parser("fix", help="Auto-fix & format Python and JS/TS files")
+    p_fix.add_argument("paths", nargs="*", help="Files or directories (default: .)")
+    p_fix.set_defaults(func=cmd_fix)
+
+    p_push = sub.add_parser("push", help="Validate configs, commit, rebase, and push to GitHub")
+    p_push.add_argument("message", nargs="*", help="Optional commit message")
+    p_push.add_argument("--force", action="store_true", help="Skip config validation")
+    p_push.set_defaults(func=cmd_push)
+
+    p_upd = sub.add_parser(
+        "update",
+        aliases=["pull", "sync"],
+        help="Pull latest rules from GitHub (pass --tools to upgrade binaries)",
+    )
+    p_upd.add_argument("--tools", action="store_true", help="Also upgrade ruff & oxlint binaries")
+    p_upd.set_defaults(func=cmd_update)
+
+    p_val = sub.add_parser("validate", help="Validate central ruff & oxlint configs")
+    p_val.set_defaults(func=cmd_validate)
+
+    p_edit = sub.add_parser("edit", help="Open central config in $EDITOR")
+    p_edit.add_argument(
+        "target",
+        nargs="?",
+        default="ruff",
+        choices=["ruff", "ts", "oxlint", "plugins"],
+        help="Which config to open (default: ruff)",
+    )
+    p_edit.set_defaults(func=cmd_edit)
+
+    p_scan = sub.add_parser("scan", help="Find scattered per-project ruff/oxlint configs")
+    p_scan.add_argument("dir", nargs="?", default=".", help="Directory to scan (default: .)")
+    p_scan.set_defaults(func=cmd_scan)
+
+    p_status = sub.add_parser("status", help="Show sync, symlink, tool, and daemon status")
+    p_status.set_defaults(func=cmd_status)
+
+    p_boot = sub.add_parser(
+        "bootstrap",
+        help="Set up symlinks, global linters, and 60s auto-sync on this machine",
+    )
+    p_boot.add_argument("--no-tools", action="store_true", help="Skip installing ruff/oxlint")
+    p_boot.add_argument("--no-daemon", action="store_true", help="Skip installing 60s sync timer")
+    p_boot.add_argument(
+        "--with-git-hook",
+        action="store_true",
+        help="Configure global Git pre-commit hook",
+    )
+    p_boot.set_defaults(func=cmd_bootstrap)
+
+    p_daemon = sub.add_parser("daemon", help="Manage the 60-second background sync timer")
+    p_daemon.add_argument(
+        "action",
+        choices=["install", "uninstall", "status", "tick"],
+        help="Daemon action",
+    )
+    p_daemon.set_defaults(func=cmd_daemon)
+
+    p_rc = sub.add_parser("ruff-check")
+    p_rc.add_argument("paths", nargs="*")
+    p_rc.set_defaults(func=cmd_ruff_check)
+
+    p_oc = sub.add_parser("oxlint-check")
+    p_oc.add_argument("paths", nargs="*")
+    p_oc.set_defaults(func=cmd_oxlint_check)
+
+    return parser
+
+
+def main() -> int:
+    ensure_rich_path()
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.command:
+        return cmd_check(argparse.Namespace(paths=["."]))
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
