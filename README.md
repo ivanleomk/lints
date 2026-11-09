@@ -5,9 +5,11 @@ Centralised **Ruff** + **Oxlint** configuration, custom AST plugins, and 1-minut
 ## Setup on Any Computer
 
 ```sh
-git clone git@github.com:ivanleomk/lints.git ~/.config/lints
+git clone https://github.com/ivanleomk/lints.git ~/.config/lints
 ~/.config/lints/bin/lints bootstrap
 ```
+
+*(Use `git@github.com:ivanleomk/lints.git` or `gh auth setup-git` on machines where you also want to run `lints push`.)*
 
 `lints bootstrap` sets up:
 1. `~/.config/ruff/ruff.toml` → `ruff.toml` (auto-discovered by Ruff CLI & IDE extensions)
