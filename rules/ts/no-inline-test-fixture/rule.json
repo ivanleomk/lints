@@ -1,0 +1,19 @@
+{
+  "summary": "Ban `>= 8`-line inline YAML/JSON/fixture template strings in test files; store fixtures in `tests/assets/`.",
+  "oxlint": {
+    "overrides": [
+      {
+        "files": [
+          "**/*.test.ts",
+          "**/*.test.tsx",
+          "**/*.spec.ts",
+          "**/*.spec.tsx"
+        ],
+        "rules": {
+          "lints/no-inline-test-fixture": "error"
+        }
+      }
+    ]
+  },
+  "defaultSeverity": "off"
+}

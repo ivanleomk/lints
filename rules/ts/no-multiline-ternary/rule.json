@@ -1,0 +1,16 @@
+{
+  "summary": "Ban nested ternaries everywhere and multi-line `? ... : ...` ternaries in `.ts` logic.",
+  "oxlint": {
+    "rules": {
+      "no-nested-ternary": "error"
+    },
+    "overrides": [
+      {
+        "files": ["**/*.tsx", "**/*.jsx"],
+        "rules": {
+          "lints/no-multiline-ternary": "off"
+        }
+      }
+    ]
+  }
+}

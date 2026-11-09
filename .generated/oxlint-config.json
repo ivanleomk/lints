@@ -1,0 +1,160 @@
+{
+  "plugins": [
+    "typescript",
+    "unicorn",
+    "import",
+    "oxc",
+    "node",
+    "react"
+  ],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn"
+  },
+  "hasCustomPlugin": true,
+  "rules": {
+    "eqeqeq": [
+      "error",
+      "smart"
+    ],
+    "prefer-const": "error",
+    "no-var": "error",
+    "no-eval": "error",
+    "no-implied-eval": "error",
+    "no-empty": [
+      "error",
+      {
+        "allowEmptyCatch": false
+      }
+    ],
+    "no-unused-vars": [
+      "error",
+      {
+        "argsIgnorePattern": "^_",
+        "varsIgnorePattern": "^_",
+        "caughtErrorsIgnorePattern": "^_"
+      }
+    ],
+    "typescript/consistent-type-imports": [
+      "error",
+      {
+        "prefer": "type-imports",
+        "fixStyle": "inline-type-imports"
+      }
+    ],
+    "unicorn/prefer-node-protocol": "error",
+    "unicorn/consistent-function-scoping": "off",
+    "import/no-cycle": "error",
+    "import/default": "off",
+    "typescript/ban-ts-comment": [
+      "error",
+      {
+        "ts-ignore": true,
+        "ts-nocheck": true,
+        "ts-expect-error": "allow-with-description",
+        "minimumDescriptionLength": 10
+      }
+    ],
+    "lints/no-default-config-singleton": "error",
+    "import/no-default-export": "error",
+    "typescript/no-explicit-any": "error",
+    "no-nested-ternary": "error",
+    "lints/no-multiline-ternary": "error",
+    "typescript/no-non-null-assertion": "error",
+    "lints/no-nullish-coalescing": "error",
+    "node/no-process-env": "error",
+    "eslint/no-restricted-properties": [
+      "error",
+      {
+        "object": "Bun",
+        "property": "env",
+        "message": "Raw `Bun.env` is banned outside `env.ts`. Fix: parse environment variables via a Zod schema in `env.ts` and import `env`. Docs: `lints explain ts/no-process-env`."
+      }
+    ],
+    "lints/no-type-assertion": "error",
+    "lints/no-zod-shorthand-pipe": "error",
+    "react/rules-of-hooks": "error"
+  },
+  "overrides": [
+    {
+      "files": [
+        "**/*.config.*",
+        "**/oxlint.config.*",
+        "**/.generated/**",
+        "**/*.stories.*",
+        "**/*.d.ts",
+        "**/app/**/{page,layout,loading,error,not-found,global-error,template,default}.{tsx,jsx,ts,js}",
+        "**/pages/**/*.{tsx,jsx,ts,js}"
+      ],
+      "rules": {
+        "import/no-default-export": "off"
+      }
+    },
+    {
+      "files": [
+        "**/*.test.ts",
+        "**/*.test.tsx",
+        "**/*.spec.ts",
+        "**/*.spec.tsx"
+      ],
+      "rules": {
+        "lints/no-inline-test-fixture": "error"
+      }
+    },
+    {
+      "files": [
+        "**/*.tsx",
+        "**/*.jsx"
+      ],
+      "rules": {
+        "lints/no-multiline-ternary": "off"
+      }
+    },
+    {
+      "files": [
+        "**/env.ts",
+        "**/config/env.ts",
+        "**/*.config.*",
+        "**/scripts/**",
+        "**/*.test.*",
+        "**/*.spec.*"
+      ],
+      "rules": {
+        "node/no-process-env": "off",
+        "eslint/no-restricted-properties": "off"
+      }
+    },
+    {
+      "files": [
+        "**/index.ts",
+        "**/index.js"
+      ],
+      "rules": {
+        "lints/pure-barrel-index": "error"
+      }
+    },
+    {
+      "files": [
+        "**/*.tsx",
+        "**/*.jsx"
+      ],
+      "rules": {
+        "react/only-export-components": [
+          "error",
+          {
+            "allowConstantExport": true
+          }
+        ]
+      }
+    }
+  ],
+  "ignorePatterns": [
+    "dist/**",
+    "build/**",
+    ".next/**",
+    "out/**",
+    "coverage/**",
+    "node_modules/**",
+    "rules/**/tests/**"
+  ]
+}

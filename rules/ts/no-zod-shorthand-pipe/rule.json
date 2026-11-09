@@ -1,0 +1,3 @@
+{
+  "summary": "Ban `.transform(...).pipe(...)` string-shorthand coercions in Zod schemas."
+}

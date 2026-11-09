@@ -1,0 +1,4 @@
+{
+  "code": "PY004",
+  "summary": "Ban raw `os.environ` / `os.getenv` outside `env.py`, `config.py`, `settings.py`, `scripts/`, and `tests/`."
+}

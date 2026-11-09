@@ -1,0 +1,4 @@
+{
+  "code": "PY001",
+  "summary": "Ban `field: str = \"\"` silent defaults on `BaseModel` / `@dataclass` classes."
+}

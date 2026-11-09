@@ -1,0 +1,17 @@
+{
+  "summary": "Ban `@ts-ignore` / `@ts-nocheck` and require a 10+ char reason on `@ts-expect-error`.",
+  "oxlint": {
+    "plugins": ["typescript"],
+    "rules": {
+      "typescript/ban-ts-comment": [
+        "error",
+        {
+          "ts-ignore": true,
+          "ts-nocheck": true,
+          "ts-expect-error": "allow-with-description",
+          "minimumDescriptionLength": 10
+        }
+      ]
+    }
+  }
+}

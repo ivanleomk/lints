@@ -1,0 +1,14 @@
+{
+  "summary": "Keep `index.ts` barrel files pure re-exports with no inline declarations.",
+  "oxlint": {
+    "overrides": [
+      {
+        "files": ["**/index.ts", "**/index.js"],
+        "rules": {
+          "lints/pure-barrel-index": "error"
+        }
+      }
+    ]
+  },
+  "defaultSeverity": "off"
+}

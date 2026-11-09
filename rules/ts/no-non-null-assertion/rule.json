@@ -1,0 +1,9 @@
+{
+  "summary": "Ban postfix `!` non-null assertions; check for `null` / `undefined` explicitly.",
+  "oxlint": {
+    "plugins": ["typescript"],
+    "rules": {
+      "typescript/no-non-null-assertion": "error"
+    }
+  }
+}

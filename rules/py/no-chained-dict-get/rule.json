@@ -1,0 +1,4 @@
+{
+  "code": "PY005",
+  "summary": "Ban chained `.get(...).get(...)` untyped dict probing; validate payloads at the boundary with Pydantic."
+}

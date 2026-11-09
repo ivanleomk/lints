@@ -1,0 +1,10 @@
+{
+  "code": "PY006",
+  "summary": "Ban dynamic `getattr()` probing; parse payloads into Pydantic models or use typed protocols.",
+  "ruff": {
+    "select": ["B009", "TID251"],
+    "bannedApi": {
+      "builtins.getattr": "Dynamic `getattr()` is banned. Fix: parse into a `pydantic.BaseModel` or type with a `Protocol` and access attributes directly. Docs: `lints explain py/no-getattr`."
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "summary": "Require all `import` statements at the top of the module (`PLC0415`), exempted in `tests/`.",
+  "ruff": {
+    "select": ["PLC0415"],
+    "perFileIgnores": {
+      "tests/**/*.py": ["PLC0415"],
+      "test_*.py": ["PLC0415"]
+    }
+  }
+}

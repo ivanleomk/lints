@@ -1,0 +1,37 @@
+# Central `lints` configuration (`lints edit` opens this file)
+# Synced across machines via `lints push` and the 60s background auto-pull.
+
+[lints]
+# Default folder directory linted when running `lints lint` with no arguments.
+# Can be "." (current directory) or a specific path like "~/code/my-project" or "src".
+# Individual projects can also drop a local `lints.toml` to set their own `target` or rule overrides.
+target = "."
+
+# Folder directory containing self-contained `<rules_dir>/ts/<rule>` and `<rules_dir>/py/<rule>` lints.
+rules_dir = "rules"
+
+[ts]
+no-nullish-coalescing = true
+no-type-assertion = true
+no-explicit-any = true
+no-non-null-assertion = true
+ban-ts-comment = true
+no-process-env = true
+no-multiline-ternary = true
+no-default-config-singleton = true
+no-zod-shorthand-pipe = true
+no-default-export = true
+pure-barrel-index = true
+no-inline-test-fixture = true
+react-boundaries = true
+
+[py]
+no-getattr = true
+no-inline-imports = true
+no-blind-except = true
+pytest-style = true
+no-silent-model-default = true
+no-tuple-bag-return = true
+no-multiline-ternary = true
+no-raw-os-environ = true
+no-chained-dict-get = true

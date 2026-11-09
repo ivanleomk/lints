@@ -1,0 +1,4 @@
+{
+  "code": "PY002",
+  "summary": "Ban functions returning 3+ element tuple bags (`-> tuple[A, B, C, ...]`); return a `@dataclass` or `BaseModel`."
+}

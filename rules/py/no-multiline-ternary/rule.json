@@ -1,0 +1,7 @@
+{
+  "code": "PY003",
+  "summary": "Ban multi-line `x if cond else y` expressions and prevent Ruff `SIM108` from suggesting ternaries.",
+  "ruff": {
+    "ignore": ["SIM108"]
+  }
+}

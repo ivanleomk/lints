@@ -1,0 +1,10 @@
+{
+  "summary": "Ban bare `except:` and blind `except Exception:` blocks (`BLE001`, `E722`) that swallow errors.",
+  "ruff": {
+    "select": ["BLE001", "E722"],
+    "perFileIgnores": {
+      "tests/**/*.py": ["BLE001"],
+      "test_*.py": ["BLE001"]
+    }
+  }
+}

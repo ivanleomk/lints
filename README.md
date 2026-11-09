@@ -1,67 +1,83 @@
 # `lints`
 
-Centralised **Ruff** + **Oxlint** configuration, custom AST plugins, and 1-minute background sync across macOS & Linux machines.
+Centralised, self-contained **Ruff** + **Oxlint** lint rules controlled via [`config.toml`](./config.toml), powered by `uv` + `.ts` plugins, and synced across machines every 60 seconds.
 
-## Setup on Any Computer
+## Setup on Any Machine
 
 ```sh
 git clone https://github.com/ivanleomk/lints.git ~/.config/lints
 ~/.config/lints/bin/lints bootstrap
 ```
 
-*(Use `git@github.com:ivanleomk/lints.git` or `gh auth setup-git` on machines where you also want to run `lints push`.)*
+`lints bootstrap` installs the `lints` CLI via `uv tool install --editable`, installs global `ruff` (via `uv`) and `oxlint`, symlinks `~/.config/ruff/ruff.toml` and `~/oxlint.config.ts`, and starts the 60-second background auto-pull daemon.
 
-`lints bootstrap` sets up:
-1. `~/.config/ruff/ruff.toml` → `ruff.toml` (auto-discovered by Ruff CLI & IDE extensions)
-2. `~/oxlint.config.mts` → `oxlint.config.mts` (auto-discovered by Oxlint CLI & IDE extensions across `~`)
-3. `~/.local/bin/lints` → `bin/lints`
-4. Global `ruff` & `oxlint` binaries (via `uv` and `bun`/`npm`)
-5. A lightweight 60-second background auto-pull timer (`launchd` on macOS, `systemd --user` or `crontab` on Linux)
+*(Use `git@github.com:ivanleomk/lints.git` or `gh auth setup-git` on machines where you also run `lints push`.)*
 
-Pass `--with-git-hook` to `lints bootstrap` if you also want Git to lint staged `.py` and `.ts/.js` files globally before every commit.
+---
+
+## Configuring via `config.toml`
+
+[`config.toml`](./config.toml) controls your default target folder, rules folder, and enabled rules:
+
+```toml
+[lints]
+target = "."        # Folder linted when you run `lints lint` with no path arguments
+rules_dir = "rules" # Folder containing `ts/<rule>` and `py/<rule>` directories
+
+[ts]
+no-nullish-coalescing = true
+no-type-assertion = true
+no-default-export = true
+# ...
+
+[py]
+no-getattr = true
+no-silent-model-default = true
+# ...
+```
+
+You can also place a `lints.toml` inside any individual project to set that project's default `target` (e.g. `target = "src"`) or disable/enable specific rules locally (`lints disable ts/no-default-export --local`).
+
+---
+
+## Self-Contained Rule Layout (`rules/<ts|py>/<rule-name>/`)
+
+Every rule is a standalone directory so humans and AI coding agents can read, test, or author a rule in isolation:
+
+```text
+rules/
+├── ts/<rule-name>/
+│   ├── rule.json         # Summary + optional built-in Oxlint rules/overrides
+│   ├── README.md         # Why it exists + how an agent should fix violations
+│   ├── rule.ts           # Optional custom TypeScript AST rule (`export const rule`)
+│   └── tests/
+│       ├── invalid.ts    # Verified to FAIL this rule in isolation
+│       └── valid.ts      # Verified to PASS this rule in isolation
+└── py/<rule-name>/
+    ├── rule.json         # Summary + Ruff rule codes or custom `PY00X` code
+    ├── README.md
+    ├── rule.py           # Optional custom Python `ast` rule (`def check(...)`)
+    └── tests/
+        ├── invalid.py
+        └── valid.py
+```
+
+---
 
 ## CLI Reference
 
 ```sh
-lints                  # Lint Python + JS/TS files in current directory
-lints check [paths...] # Same as `lints`, targeting specific files/folders
-lints fix [paths...]   # Run ruff --fix + ruff format + oxlint --fix
-lints edit ruff        # Edit central ruff.toml in $EDITOR
-lints edit ts          # Edit central oxlint.base.json in $EDITOR
-lints edit plugins     # Edit custom Oxlint AST rules in plugins/custom.mjs
-lints validate         # Validate central Ruff & Oxlint configs + JS plugins
-lints push [msg]       # Validate -> commit -> pull --rebase -> push to GitHub
-lints update           # Pull latest rules immediately (--tools upgrades binaries)
-lints scan ~/code      # Find old scattered per-project ruff/oxlint configs
-lints status           # Show git state, symlinks, linter paths, and 60s sync status
-lints daemon status    # Inspect/manage background timer (install|uninstall|status|tick)
-```
-
-## Per-Project Overrides (When Needed)
-
-### Python (`ruff.toml`)
-```toml
-extend = "~/.config/ruff/ruff.toml"
-
-[lint]
-ignore = ["B008"]
-```
-
-### TypeScript / JavaScript (`oxlint.config.mts`)
-```ts
-import os from "node:os";
-import path from "node:path";
-import { pathToFileURL } from "node:url";
-
-const { default: base } = await import(
-  pathToFileURL(path.join(os.homedir(), "oxlint.config.mts")).href
-);
-
-export default {
-  ...base,
-  rules: {
-    ...base.rules,
-    "no-console": "off",
-  },
-};
+lints lint [paths...]             # Lint configured `target` directory (or explicit paths)
+lints fix [paths...]              # Auto-fix & format Python (`ruff`) and TS (`oxlint`)
+lints list                        # List all rules (`[on]`/`[off]`, `ast`/`cfg`, summary)
+lints enable ts/no-process-env    # Enable rule in config.toml (--local for ./lints.toml)
+lints disable ts/no-default-export # Disable rule in config.toml (--local for ./lints.toml)
+lints target ~/code/my-app        # Set default folder linted by `lints lint` (--local for project)
+lints rules-dir ./rules           # Set main rules folder directory in config.toml
+lints new ts/no-date-now          # Scaffold a new self-contained rule folder + tests
+lints test [rule]                 # Run hermetic valid/invalid fixture tests per rule
+lints explain ts/no-type-assertion # Print README + invalid/valid test fixtures for agents
+lints push [message]              # Run `lints test` -> compile configs -> commit & push
+lints update                      # Pull latest rules immediately (--tools upgrades binaries)
+lints status                      # Show git, symlinks, linter binaries, and 60s sync status
 ```

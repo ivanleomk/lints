@@ -1,0 +1,25 @@
+{
+  "summary": "Enforce named exports for ripgrep searchability (exempts `*.config.*`, plugins, Next/router pages, stories).",
+  "oxlint": {
+    "plugins": ["import"],
+    "rules": {
+      "import/no-default-export": "error"
+    },
+    "overrides": [
+      {
+        "files": [
+          "**/*.config.*",
+          "**/oxlint.config.*",
+          "**/.generated/**",
+          "**/*.stories.*",
+          "**/*.d.ts",
+          "**/app/**/{page,layout,loading,error,not-found,global-error,template,default}.{tsx,jsx,ts,js}",
+          "**/pages/**/*.{tsx,jsx,ts,js}"
+        ],
+        "rules": {
+          "import/no-default-export": "off"
+        }
+      }
+    ]
+  }
+}

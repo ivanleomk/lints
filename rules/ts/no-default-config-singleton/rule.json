@@ -1,0 +1,3 @@
+{
+  "summary": "Ban exported `DEFAULT_*_CONFIG` object singletons; fail fast when required config is absent."
+}

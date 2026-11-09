@@ -1,0 +1,6 @@
+{
+  "summary": "Enforce clean `@pytest.mark.parametrize` and specific `pytest.raises` assertions (`PT`).",
+  "ruff": {
+    "select": ["PT"]
+  }
+}
