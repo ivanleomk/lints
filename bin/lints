@@ -183,28 +183,40 @@ def is_python_script(path: Path) -> bool:
         return False
 
 
-def detect_languages(targets: list[str]) -> tuple[bool, bool]:
-    has_py = False
-    has_ts = False
+def partition_targets(targets: list[str]) -> tuple[list[str], list[str]]:
+    py_targets: list[str] = []
+    ts_targets: list[str] = []
     for raw in targets:
         p = Path(raw)
         if p.is_file():
             ext = p.suffix.lower()
-            has_py = has_py or is_python_script(p)
-            has_ts = has_ts or (ext in TS_EXTS)
+            if is_python_script(p):
+                py_targets.append(raw)
+            if ext in TS_EXTS:
+                ts_targets.append(raw)
         elif p.is_dir():
+            dir_has_py = False
+            dir_has_ts = False
+            shebang_scripts: list[str] = []
             for root, dirs, files in os.walk(p):
                 dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
                 root_path = Path(root)
                 for fname in files:
                     ext = Path(fname).suffix.lower()
-                    if ext in PY_EXTS or (not ext and is_python_script(root_path / fname)):
-                        has_py = True
+                    if ext in PY_EXTS:
+                        dir_has_py = True
+                    elif not ext:
+                        candidate = root_path / fname
+                        if is_python_script(candidate):
+                            shebang_scripts.append(str(candidate))
                     elif ext in TS_EXTS:
-                        has_ts = True
-                    if has_py and has_ts:
-                        return True, True
-    return has_py, has_ts
+                        dir_has_ts = True
+            if dir_has_py:
+                py_targets.append(raw)
+            py_targets.extend(shebang_scripts)
+            if dir_has_ts:
+                ts_targets.append(raw)
+    return list(dict.fromkeys(py_targets)), list(dict.fromkeys(ts_targets))
 
 
 def has_local_ruff_config(start: Path) -> bool:
@@ -282,31 +294,31 @@ def cmd_oxlint_check(args: argparse.Namespace) -> int:
 
 def cmd_check(args: argparse.Namespace) -> int:
     targets = args.paths or ["."]
-    has_py, has_ts = detect_languages(targets)
-    if not has_py and not has_ts:
+    py_targets, ts_targets = partition_targets(targets)
+    if not py_targets and not ts_targets:
         print("No Python or JS/TS files found to lint.")
         return 0
 
     exit_code = 0
-    if has_py:
+    if py_targets:
         ruff = resolve_ruff_cmd()
         if not ruff:
             print("error: ruff not found (run `lints bootstrap`)", file=sys.stderr)
             exit_code = 1
         else:
             print("==> ruff check")
-            res = run([*ruff, "check", *ruff_config_args(targets), *targets], check=False)
+            res = run([*ruff, "check", *ruff_config_args(py_targets), *py_targets], check=False)
             if res.returncode != 0:
                 exit_code = res.returncode
 
-    if has_ts:
+    if ts_targets:
         oxlint = resolve_oxlint_cmd()
         if not oxlint:
             print("error: oxlint not found (run `lints bootstrap`)", file=sys.stderr)
             exit_code = 1
         else:
             print("==> oxlint")
-            res = run([*oxlint, *oxlint_config_args(targets), *targets], check=False)
+            res = run([*oxlint, *oxlint_config_args(ts_targets), *ts_targets], check=False)
             if res.returncode != 0:
                 exit_code = res.returncode
 
@@ -315,34 +327,34 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 def cmd_fix(args: argparse.Namespace) -> int:
     targets = args.paths or ["."]
-    has_py, has_ts = detect_languages(targets)
-    if not has_py and not has_ts:
+    py_targets, ts_targets = partition_targets(targets)
+    if not py_targets and not ts_targets:
         print("No Python or JS/TS files found to fix.")
         return 0
 
     exit_code = 0
-    if has_py:
+    if py_targets:
         ruff = resolve_ruff_cmd()
         if not ruff:
             print("error: ruff not found (run `lints bootstrap`)", file=sys.stderr)
             exit_code = 1
         else:
-            cfg = ruff_config_args(targets)
+            cfg = ruff_config_args(py_targets)
             print("==> ruff check --fix")
-            r1 = run([*ruff, "check", "--fix", *cfg, *targets], check=False)
+            r1 = run([*ruff, "check", "--fix", *cfg, *py_targets], check=False)
             print("==> ruff format")
-            r2 = run([*ruff, "format", *cfg, *targets], check=False)
+            r2 = run([*ruff, "format", *cfg, *py_targets], check=False)
             if r1.returncode != 0 or r2.returncode != 0:
                 exit_code = r1.returncode or r2.returncode
 
-    if has_ts:
+    if ts_targets:
         oxlint = resolve_oxlint_cmd()
         if not oxlint:
             print("error: oxlint not found (run `lints bootstrap`)", file=sys.stderr)
             exit_code = 1
         else:
             print("==> oxlint --fix")
-            r3 = run([*oxlint, "--fix", *oxlint_config_args(targets), *targets], check=False)
+            r3 = run([*oxlint, "--fix", *oxlint_config_args(ts_targets), *ts_targets], check=False)
             if r3.returncode != 0:
                 exit_code = r3.returncode
 
