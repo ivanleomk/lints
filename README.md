@@ -9,10 +9,13 @@ git clone https://github.com/ivanleomk/lints.git ~/.config/lints
 ~/.config/lints/bin/lints bootstrap
 ```
 
-Optional: register `lints` as a **pre-turn-end Antigravity lifecycle hook** (`~/.gemini/config/hooks.json` or `--local` for `.agents/hooks.json`):
+Optional: register `lints` as a **pre-turn-end lifecycle hook** for your coding agent (`--local` scopes to the current repo instead of global):
 
 ```sh
-lints hook install
+lints hook install --agent antigravity   # ~/.gemini/config/hooks.json (or .agents/hooks.json)
+lints hook install --agent claude        # ~/.claude/settings.json     (or .claude/settings.json)
+lints hook install --agent codex         # ~/.codex/hooks.json         (or .codex/hooks.json)
+lints hook install --agent git           # global core.hooksPath       (or .git/hooks/pre-commit)
 ```
 
 * **`PreInvocation`:** Injects your enabled `checklists/*.md` (`code-quality`, `pr-quality`) as a transient `ephemeralMessage` at turn start (zero permanent context bloat).
@@ -43,5 +46,5 @@ lints target ~/code/my-app        # Set default folder linted by `lints lint` (-
 lints new ts/no-date-now          # Scaffold a new self-contained rule folder + tests
 lints test [rule]                 # Run hermetic valid/invalid fixture tests per rule
 lints explain ts/no-type-assertion # Print README + invalid/valid test fixtures for agents
-lints hook install                # Install Antigravity PreInvocation + Stop hooks (--local optional)
+lints hook install --agent <name> # Install pre-turn-end hooks (antigravity|claude|codex|git)
 ```

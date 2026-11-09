@@ -7,6 +7,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import datetime as dt
+from enum import StrEnum
 import importlib.util
 import json
 import os
@@ -754,74 +755,183 @@ def _dirty_code_files(workspaces: list[str]) -> list[str]:
     return list(dict.fromkeys(dirty))
 
 
+class HookAgent(StrEnum):
+    ANTIGRAVITY = "antigravity"
+    CLAUDE = "claude"
+    CODEX = "codex"
+    GIT = "git"
+
+
+def _check_dirty_files_lint(workspaces: list[str]) -> tuple[bool, str]:
+    files = _dirty_code_files(workspaces)
+    if not files:
+        return True, ""
+    uv_bin = shutil.which("uv") or "uv"
+    res = subprocess.run(
+        [uv_bin, "run", "--quiet", "--project", str(REPO_DIR), "lints", "lint", *files],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return res.returncode == 0, (res.stdout + "\n" + res.stderr).strip()
+
+
+def _filter_claude_codex_entries(entries: list[object], marker: str) -> list[object]:
+    return [e for e in entries if marker not in json.dumps(e)]
+
+
 @app.command()
 def hook(
     action: str = typer.Argument(..., help="install | uninstall | stop | pre-invocation"),
-    local: bool = typer.Option(False, "--local", help="Write .agents/hooks.json instead of global"),
+    agent: HookAgent = typer.Option(..., "--agent", "-a", help="Target agent or harness"),
+    local: bool = typer.Option(False, "--local", help="Install in current repo instead of global"),
 ) -> None:
-    """Antigravity lifecycle hook integration (pre-turn-end lint gate + checklists)."""
+    """Install or run pre-turn-end lint & checklist hooks (`--agent antigravity|claude|codex|git`)."""
+    bin_cmd = str(REPO_DIR / "bin/lints")
+
     if action == "stop":
         raw = sys.stdin.read().strip()
         payload = json.loads(raw) if raw else {}
-        if payload.get("terminationReason") != "NO_TOOL_CALL":
-            sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
+        if agent == HookAgent.ANTIGRAVITY:
+            if payload.get("terminationReason") != "NO_TOOL_CALL":
+                sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
+                return
+            ok, out = _check_dirty_files_lint([str(p) for p in payload.get("workspacePaths", [])])
+            if ok:
+                sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
+            else:
+                reason = f"Pre-turn-end `lints` gate failed on modified files. Fix before finishing:\n\n{out}"
+                sys.stdout.write(json.dumps({"decision": "continue", "reason": reason}) + "\n")
             return
-        files = _dirty_code_files([str(p) for p in payload.get("workspacePaths", [])])
-        if not files:
-            sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
+
+        # Claude Code & Codex CLI pass `cwd` and `stop_hook_active`
+        if payload.get("stop_hook_active"):
             return
-        uv_bin = shutil.which("uv") or "uv"
-        res = subprocess.run(
-            [uv_bin, "run", "--quiet", "--project", str(REPO_DIR), "lints", "lint", *files],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if res.returncode == 0:
-            sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
-            return
-        out = (res.stdout + "\n" + res.stderr).strip()
-        reason = f"Pre-turn-end `lints` gate failed on modified files. Fix all errors before finishing:\n\n{out}"
-        sys.stdout.write(json.dumps({"decision": "continue", "reason": reason}) + "\n")
+        cwd = str(payload.get("cwd") or Path.cwd())
+        ok, out = _check_dirty_files_lint([cwd])
+        if not ok:
+            reason = f"Pre-turn-end `lints` gate failed on modified files. Fix before finishing:\n\n{out}"
+            if agent == HookAgent.CODEX:
+                sys.stderr.write(reason + "\n")
+                raise typer.Exit(2)
+            sys.stdout.write(json.dumps({"decision": "block", "reason": reason}) + "\n")
         return
 
     if action == "pre-invocation":
         raw = sys.stdin.read().strip()
         payload = json.loads(raw) if raw else {}
         text = _render_checklists()
-        if payload.get("invocationNum", 1) == 1 and payload.get("workspacePaths") and text:
-            msg = f"Self-check your changes against these engineering checklists before finishing:\n\n{text}"
-            sys.stdout.write(json.dumps({"injectSteps": [{"ephemeralMessage": msg}]}) + "\n")
+        if not text:
+            if agent == HookAgent.ANTIGRAVITY:
+                sys.stdout.write("{}\n")
+            return
+        msg = f"Self-check your changes against these engineering checklists before finishing:\n\n{text}"
+        if agent == HookAgent.ANTIGRAVITY:
+            if payload.get("invocationNum", 1) == 1 and payload.get("workspacePaths"):
+                sys.stdout.write(json.dumps({"injectSteps": [{"ephemeralMessage": msg}]}) + "\n")
+            else:
+                sys.stdout.write("{}\n")
         else:
-            sys.stdout.write("{}\n")
+            sys.stdout.write(msg + "\n")
         return
 
-    if local:
-        hooks_file = Path.cwd() / ".agents/hooks.json"
-    else:
-        hooks_file = Path.home() / ".gemini/config/hooks.json"
-    hooks_file.parent.mkdir(parents=True, exist_ok=True)
-    data: dict[str, object] = json.loads(hooks_file.read_text()) if hooks_file.exists() else {}
+    if agent == HookAgent.GIT:
+        if local:
+            dest = Path.cwd() / ".git/hooks/pre-commit"
+            if action == "uninstall":
+                dest.unlink(missing_ok=True)
+                typer.echo(f"Removed {dest}")
+            else:
+                dest.unlink(missing_ok=True)
+                dest.symlink_to(REPO_DIR / "hooks/pre-commit")
+                typer.echo(f"Linked {dest} -> {REPO_DIR / 'hooks/pre-commit'}")
+        elif action == "uninstall":
+            subprocess.run(["git", "config", "--global", "--unset", "core.hooksPath"], check=False)
+            typer.echo("Unset global git core.hooksPath")
+        else:
+            subprocess.run(
+                ["git", "config", "--global", "core.hooksPath", str(REPO_DIR / "hooks")], check=True
+            )
+            typer.echo(f"Set global git core.hooksPath -> {REPO_DIR / 'hooks'}")
+        return
 
-    if action == "uninstall":
-        data.pop("lints", None)
+    if agent == HookAgent.ANTIGRAVITY:
+        if local:
+            hooks_file = Path.cwd() / ".agents/hooks.json"
+        else:
+            hooks_file = Path.home() / ".gemini/config/hooks.json"
+        hooks_file.parent.mkdir(parents=True, exist_ok=True)
+        data: dict[str, object] = json.loads(hooks_file.read_text()) if hooks_file.exists() else {}
+        if action == "uninstall":
+            data.pop("lints", None)
+        elif action == "install":
+            data["lints"] = {
+                "PreInvocation": [
+                    {
+                        "type": "command",
+                        "command": f"{bin_cmd} hook pre-invocation --agent antigravity",
+                        "timeout": 10,
+                    }
+                ],
+                "Stop": [
+                    {
+                        "type": "command",
+                        "command": f"{bin_cmd} hook stop --agent antigravity",
+                        "timeout": 20,
+                    }
+                ],
+            }
+        else:
+            raise typer.BadParameter(f"Unknown hook action `{action}`")
         hooks_file.write_text(json.dumps(data, indent=2) + "\n")
-        typer.echo(f"Removed `lints` hook from {hooks_file}")
+        typer.echo(f"{action.title()}ed Antigravity hooks in {hooks_file}")
         return
 
-    if action == "install":
-        bin_cmd = f"{REPO_DIR / 'bin/lints'}"
-        data["lints"] = {
-            "PreInvocation": [
-                {"type": "command", "command": f"{bin_cmd} hook pre-invocation", "timeout": 10}
-            ],
-            "Stop": [{"type": "command", "command": f"{bin_cmd} hook stop", "timeout": 20}],
-        }
-        hooks_file.write_text(json.dumps(data, indent=2) + "\n")
-        typer.echo(f"Installed Antigravity PreInvocation + Stop hooks in {hooks_file}")
+    start_entry = {
+        "hooks": [
+            {"type": "command", "command": f"{bin_cmd} hook pre-invocation --agent {agent.value}"}
+        ]
+    }
+    stop_entry = {
+        "hooks": [
+            {
+                "type": "command",
+                "command": f"{bin_cmd} hook stop --agent {agent.value}",
+                "timeout": 20,
+            }
+        ]
+    }
+
+    if agent == HookAgent.CLAUDE:
+        cfg_file = (
+            Path.cwd() / ".claude/settings.json" if local else Path.home() / ".claude/settings.json"
+        )
+        cfg_file.parent.mkdir(parents=True, exist_ok=True)
+        root: dict[str, object] = json.loads(cfg_file.read_text()) if cfg_file.exists() else {}
+        hooks_map = root.setdefault("hooks", {})
+        if isinstance(hooks_map, dict):
+            for ev, entry in (("UserPromptSubmit", start_entry), ("Stop", stop_entry)):
+                cur_list = hooks_map.get(ev, [])
+                cleaned = _filter_claude_codex_entries(
+                    cur_list if isinstance(cur_list, list) else [], bin_cmd
+                )
+                hooks_map[ev] = [*cleaned, entry] if action == "install" else cleaned
+        cfg_file.write_text(json.dumps(root, indent=2) + "\n")
+        typer.echo(f"{action.title()}ed Claude Code hooks in {cfg_file}")
         return
 
-    raise typer.BadParameter(f"Unknown hook action `{action}`")
+    # HookAgent.CODEX
+    cfg_file = Path.cwd() / ".codex/hooks.json" if local else Path.home() / ".codex/hooks.json"
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    codex_root: dict[str, object] = json.loads(cfg_file.read_text()) if cfg_file.exists() else {}
+    for ev, entry in (("UserPromptSubmit", start_entry), ("Stop", stop_entry)):
+        cur_list = codex_root.get(ev, [])
+        cleaned = _filter_claude_codex_entries(
+            cur_list if isinstance(cur_list, list) else [], bin_cmd
+        )
+        codex_root[ev] = [*cleaned, entry] if action == "install" else cleaned
+    cfg_file.write_text(json.dumps(codex_root, indent=2) + "\n")
+    typer.echo(f"{action.title()}ed Codex hooks in {cfg_file}")
 
 
 @app.command()
