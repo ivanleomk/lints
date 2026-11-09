@@ -1,14 +1,16 @@
 # Central `lints` configuration (`lints edit` opens this file)
-# Synced across machines via `lints push` and the 60s background auto-pull.
+# Synced across machines via `lints sync` / `lints propose` / `lints merge`.
 
 [lints]
 # Default folder directory linted when running `lints lint` with no arguments.
-# Can be "." (current directory) or a specific path like "~/code/my-project" or "src".
 # Individual projects can also drop a local `lints.toml` to set their own `target` or rule overrides.
 target = "."
-
-# Folder directory containing self-contained `<rules_dir>/ts/<rule>` and `<rules_dir>/py/<rule>` lints.
 rules_dir = "rules"
+checklists_dir = "checklists"
+
+[checklists]
+code-quality = true
+pr-quality = true
 
 [ts]
 no-nullish-coalescing = false
