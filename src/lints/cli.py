@@ -6,15 +6,18 @@ import ast
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import datetime as dt
 import importlib.util
 import json
 import os
 from pathlib import Path
 import platform
 import plistlib
+import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import tomllib
 
@@ -75,10 +78,12 @@ class RuleMeta(BaseModel):
 class LintsSettings(BaseModel):
     target: str = "."
     rules_dir: str = "rules"
+    checklists_dir: str = "checklists"
 
 
 class ConfigFile(BaseModel):
     lints: LintsSettings = LintsSettings()
+    checklists: dict[str, bool] = {}
     ts: dict[str, bool] = {}
     py: dict[str, bool] = {}
 
@@ -124,7 +129,12 @@ def _load_config() -> tuple[ConfigFile, Path | None]:
         if local.exists() and local != CONFIG_TOML.resolve():
             loc = ConfigFile.model_validate(tomllib.loads(local.read_text()))
             merged = ConfigFile(
-                lints=LintsSettings(target=loc.lints.target, rules_dir=base.lints.rules_dir),
+                lints=LintsSettings(
+                    target=loc.lints.target,
+                    rules_dir=base.lints.rules_dir,
+                    checklists_dir=base.lints.checklists_dir,
+                ),
+                checklists={**base.checklists, **loc.checklists},
                 ts={**base.ts, **loc.ts},
                 py={**base.py, **loc.py},
             )
@@ -597,30 +607,226 @@ def run_tests(rule: str | None = typer.Argument(None)) -> None:
         raise typer.Exit(1)
 
 
+def _render_checklists(cfg: ConfigFile | None = None) -> str:
+    active = cfg or _load_config()[0]
+    cdir = (REPO_DIR / Path(active.lints.checklists_dir).expanduser()).resolve()
+    if not cdir.is_dir():
+        return ""
+    blocks = [
+        md.read_text().strip()
+        for md in sorted(cdir.glob("*.md"))
+        if active.checklists.get(md.stem, True)
+    ]
+    return "\n\n".join(blocks)
+
+
 @app.command()
-def update() -> None:
-    """Pull latest rules from GitHub and rebuild configs."""
-    subprocess.run(["git", "pull", "--rebase", "--autostash", "--quiet"], cwd=REPO_DIR, check=True)
+def checklist() -> None:
+    """Print enabled model self-check lists from checklists/."""
+    typer.echo(_render_checklists())
+
+
+def _current_branch() -> str:
+    return subprocess.check_output(
+        ["git", "symbolic-ref", "--short", "HEAD"], cwd=REPO_DIR, text=True
+    ).strip()
+
+
+@app.command()
+def sync(background: bool = typer.Option(False, "--background", hidden=True)) -> None:
+    """Pull latest merged rules on main and rebuild configs."""
+    branch = _current_branch()
+    dirty = bool(
+        subprocess.check_output(["git", "status", "--porcelain"], cwd=REPO_DIR, text=True).strip()
+    )
+    if branch != "main":
+        if background or dirty:
+            return
+        subprocess.run(["git", "checkout", "--quiet", "main"], cwd=REPO_DIR, check=True)
+    subprocess.run(
+        ["git", "pull", "--rebase", "--autostash", "--quiet", "origin", "main"],
+        cwd=REPO_DIR,
+        check=True,
+    )
     build()
+    if not background:
+        typer.echo("Synced with origin/main and rebuilt configs.")
 
 
 @app.command()
-def push(message: str = typer.Argument(""), force: bool = typer.Option(False, "--force")) -> None:
-    """Test rules, rebuild configs, commit, rebase, and push to GitHub."""
+def propose(
+    title: str = typer.Argument(""),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Run tests, push a branch, and open/update a PR on GitHub."""
     build()
     if not force:
         run_tests(None)
+
+    host = socket.gethostname().split(".")[0]
+    pr_title = title or f"chore: propose lint updates ({host})"
+    slug = re.sub(r"[^a-z0-9]+", "-", pr_title.lower()).strip("-")[:36] or "update"
+
+    if _current_branch() == "main":
+        stamp = dt.datetime.now().strftime("%m%d-%H%M")
+        subprocess.run(
+            ["git", "checkout", "-b", f"propose/{slug}-{stamp}"], cwd=REPO_DIR, check=True
+        )
+
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=REPO_DIR, text=True).strip():
         subprocess.run(["git", "add", "-A"], cwd=REPO_DIR, check=True)
-        msg = message or f"chore: update lints ({socket.gethostname().split('.')[0]})"
-        subprocess.run(["git", "commit", "-m", msg], cwd=REPO_DIR, check=True)
-    update()
-    subprocess.run(["git", "push", "-u", "origin", "HEAD"], cwd=REPO_DIR, check=True)
+        subprocess.run(["git", "commit", "-m", pr_title], cwd=REPO_DIR, check=True)
+
+    branch = _current_branch()
+    subprocess.run(["git", "push", "-u", "origin", branch], cwd=REPO_DIR, check=True)
+
+    existing = subprocess.run(
+        ["gh", "pr", "view", branch, "--json", "url", "--jq", ".url"],
+        cwd=REPO_DIR,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if existing.returncode == 0 and existing.stdout.strip():
+        typer.echo(f"Updated PR: {existing.stdout.strip()}")
+    else:
+        subprocess.run(
+            ["gh", "pr", "create", "--title", pr_title, "--body", "Validated via `lints test`."],
+            cwd=REPO_DIR,
+            check=True,
+        )
+
+
+@app.command()
+def merge(pr: str | None = typer.Argument(None)) -> None:
+    """Squash-merge a proposed PR (defaults to current or latest open PR) and sync main."""
+    target_pr = pr
+    if not target_pr and _current_branch() == "main":
+        listed = subprocess.check_output(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--limit",
+                "1",
+                "--json",
+                "number",
+                "--jq",
+                ".[0].number // empty",
+            ],
+            cwd=REPO_DIR,
+            text=True,
+        ).strip()
+        if not listed:
+            typer.echo("No open PRs to merge.")
+            return
+        target_pr = listed
+
+    cmd = ["gh", "pr", "merge", *([target_pr] if target_pr else []), "--squash", "--delete-branch"]
+    subprocess.run(cmd, cwd=REPO_DIR, check=True)
+    if _current_branch() != "main":
+        subprocess.run(["git", "checkout", "main"], cwd=REPO_DIR, check=True)
+    sync(background=False)
+
+
+def _dirty_code_files(workspaces: list[str]) -> list[str]:
+    dirty: list[str] = []
+    for ws in workspaces:
+        ws_path = Path(ws)
+        if not ws_path.is_dir():
+            continue
+        res = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=ws_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            continue
+        for line in res.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            rel = line[3:].split(" -> ")[-1].strip().strip('"')
+            fp = (ws_path / rel).resolve()
+            if fp.is_file() and (fp.suffix in PY_EXTS or fp.suffix in TS_EXTS):
+                dirty.append(str(fp))
+    return list(dict.fromkeys(dirty))
+
+
+@app.command()
+def hook(
+    action: str = typer.Argument(..., help="install | uninstall | stop | pre-invocation"),
+    local: bool = typer.Option(False, "--local", help="Write .agents/hooks.json instead of global"),
+) -> None:
+    """Antigravity lifecycle hook integration (pre-turn-end lint gate + checklists)."""
+    if action == "stop":
+        raw = sys.stdin.read().strip()
+        payload = json.loads(raw) if raw else {}
+        if payload.get("terminationReason") != "NO_TOOL_CALL":
+            sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
+            return
+        files = _dirty_code_files([str(p) for p in payload.get("workspacePaths", [])])
+        if not files:
+            sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
+            return
+        uv_bin = shutil.which("uv") or "uv"
+        res = subprocess.run(
+            [uv_bin, "run", "--quiet", "--project", str(REPO_DIR), "lints", "lint", *files],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
+            return
+        out = (res.stdout + "\n" + res.stderr).strip()
+        reason = f"Pre-turn-end `lints` gate failed on modified files. Fix all errors before finishing:\n\n{out}"
+        sys.stdout.write(json.dumps({"decision": "continue", "reason": reason}) + "\n")
+        return
+
+    if action == "pre-invocation":
+        raw = sys.stdin.read().strip()
+        payload = json.loads(raw) if raw else {}
+        text = _render_checklists()
+        if payload.get("invocationNum", 1) == 1 and payload.get("workspacePaths") and text:
+            msg = f"Self-check your changes against these engineering checklists before finishing:\n\n{text}"
+            sys.stdout.write(json.dumps({"injectSteps": [{"ephemeralMessage": msg}]}) + "\n")
+        else:
+            sys.stdout.write("{}\n")
+        return
+
+    if local:
+        hooks_file = Path.cwd() / ".agents/hooks.json"
+    else:
+        hooks_file = Path.home() / ".gemini/config/hooks.json"
+    hooks_file.parent.mkdir(parents=True, exist_ok=True)
+    data: dict[str, object] = json.loads(hooks_file.read_text()) if hooks_file.exists() else {}
+
+    if action == "uninstall":
+        data.pop("lints", None)
+        hooks_file.write_text(json.dumps(data, indent=2) + "\n")
+        typer.echo(f"Removed `lints` hook from {hooks_file}")
+        return
+
+    if action == "install":
+        bin_cmd = f"{REPO_DIR / 'bin/lints'}"
+        data["lints"] = {
+            "PreInvocation": [
+                {"type": "command", "command": f"{bin_cmd} hook pre-invocation", "timeout": 10}
+            ],
+            "Stop": [{"type": "command", "command": f"{bin_cmd} hook stop", "timeout": 20}],
+        }
+        hooks_file.write_text(json.dumps(data, indent=2) + "\n")
+        typer.echo(f"Installed Antigravity PreInvocation + Stop hooks in {hooks_file}")
+        return
+
+    raise typer.BadParameter(f"Unknown hook action `{action}`")
 
 
 @app.command()
 def bootstrap(with_git_hook: bool = typer.Option(False, "--with-git-hook")) -> None:
-    """Link central configs, install uv/oxlint tools, and start 60s auto-pull."""
+    """Link central configs, install uv/oxlint tools, and start 60s auto-sync."""
     rich_path = _setup_path()
     build()
     for link, target_file in (
@@ -643,7 +849,16 @@ def bootstrap(with_git_hook: bool = typer.Option(False, "--with-git-hook")) -> N
         )
 
     uv_bin = shutil.which("uv") or "uv"
-    sync_cmd = [uv_bin, "run", "--quiet", "--project", str(REPO_DIR), "lints", "update"]
+    sync_cmd = [
+        uv_bin,
+        "run",
+        "--quiet",
+        "--project",
+        str(REPO_DIR),
+        "lints",
+        "sync",
+        "--background",
+    ]
     if platform.system() == "Darwin":
         PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
         PLIST_PATH.write_bytes(
