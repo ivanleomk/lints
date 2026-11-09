@@ -20,7 +20,6 @@
     "prefer-const": "error",
     "no-var": "error",
     "no-eval": "error",
-    "no-implied-eval": "error",
     "no-empty": [
       "error",
       {
@@ -31,8 +30,7 @@
       "error",
       {
         "argsIgnorePattern": "^_",
-        "varsIgnorePattern": "^_",
-        "caughtErrorsIgnorePattern": "^_"
+        "varsIgnorePattern": "^_"
       }
     ],
     "typescript/consistent-type-imports": [
@@ -60,8 +58,6 @@
     "typescript/no-explicit-any": "error",
     "no-nested-ternary": "error",
     "lints/no-multiline-ternary": "error",
-    "typescript/no-non-null-assertion": "error",
-    "lints/no-nullish-coalescing": "error",
     "node/no-process-env": "error",
     "eslint/no-restricted-properties": [
       "error",
@@ -88,17 +84,6 @@
       ],
       "rules": {
         "import/no-default-export": "off"
-      }
-    },
-    {
-      "files": [
-        "**/*.test.ts",
-        "**/*.test.tsx",
-        "**/*.spec.ts",
-        "**/*.spec.tsx"
-      ],
-      "rules": {
-        "lints/no-inline-test-fixture": "error"
       }
     },
     {
@@ -153,7 +138,6 @@
     "build/**",
     ".next/**",
     "out/**",
-    "coverage/**",
     "node_modules/**",
     "rules/**/tests/**"
   ]

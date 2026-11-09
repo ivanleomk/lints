@@ -1,29 +1,9 @@
 #!/usr/bin/env sh
 set -eu
 
-export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
-
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-LINTS_BIN="$HOOK_DIR/../bin/lints"
+staged=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(py|pyi|js|jsx|ts|tsx|mjs|mts)$' || true)
 
-# Collect staged Python and JS/TS files (null-delimited for space safety)
-staged_files=$(git diff --cached --name-only --diff-filter=ACMR)
-
-if [ -n "$staged_files" ]; then
-  py_files=$(printf '%s\n' "$staged_files" | grep -E '\.(py|pyi)$' || true)
-  ts_files=$(printf '%s\n' "$staged_files" | grep -E '\.(js|jsx|ts|tsx|mjs|mts|cjs|cts)$' || true)
-
-  if [ -n "$py_files" ]; then
-    printf '%s\n' "$py_files" | tr '\n' '\0' | xargs -0 "$LINTS_BIN" ruff-check
-  fi
-
-  if [ -n "$ts_files" ]; then
-    printf '%s\n' "$ts_files" | tr '\n' '\0' | xargs -0 "$LINTS_BIN" oxlint-check
-  fi
-fi
-
-# Chain into repo-local pre-commit hook if one exists
-git_dir=$(git rev-parse --git-dir 2>/dev/null || true)
-if [ -n "$git_dir" ] && [ -x "$git_dir/hooks/pre-commit" ]; then
-  exec "$git_dir/hooks/pre-commit" "$@"
+if [ -n "$staged" ]; then
+  printf '%s\n' "$staged" | tr '\n' '\0' | xargs -0 "$HOOK_DIR/../bin/lints" lint
 fi

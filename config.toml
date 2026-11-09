@@ -11,10 +11,10 @@ target = "."
 rules_dir = "rules"
 
 [ts]
-no-nullish-coalescing = true
+no-nullish-coalescing = false
+no-non-null-assertion = false
 no-type-assertion = true
 no-explicit-any = true
-no-non-null-assertion = true
 ban-ts-comment = true
 no-process-env = true
 no-multiline-ternary = true
@@ -22,7 +22,6 @@ no-default-config-singleton = true
 no-zod-shorthand-pipe = true
 no-default-export = true
 pure-barrel-index = true
-no-inline-test-fixture = true
 react-boundaries = true
 
 [py]

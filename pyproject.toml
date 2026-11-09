@@ -1,15 +1,18 @@
 [project]
 name = "lints"
-version = "0.2.0"
-description = "Self-contained Ruff + Oxlint lint rules and cross-machine sync"
+version = "0.3.0"
+description = "Self-contained Ruff + Oxlint lint rules managed via uv & Typer"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "pydantic>=2.10.0",
   "ruff>=0.15.0",
+  "tomlkit>=0.13.0",
+  "typer>=0.15.0",
 ]
 
 [project.scripts]
-lints = "lints.cli:main"
+lints = "lints.cli:app"
 
 [build-system]
 requires = ["hatchling"]

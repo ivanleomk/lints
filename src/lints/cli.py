@@ -1,292 +1,679 @@
-"""CLI entrypoint for `lints`."""
+"""Minimal uv + Typer CLI for self-contained Ruff & Oxlint rules."""
 
 from __future__ import annotations
 
-import argparse
+import ast
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+import importlib.util
+import json
+import os
 from pathlib import Path
+import platform
+import plistlib
+import shutil
+import socket
 import subprocess
-import sys
+import tempfile
+import tomllib
 
-from lints.config import (
-    CONFIG_TOML,
-    RuleSpec,
-    build_artifacts,
-    discover_rules,
-    load_toml_config,
-    set_lints_setting,
-    set_rule_enabled,
+from pydantic import BaseModel, Field
+import tomlkit
+import typer
+
+REPO_DIR = Path(__file__).resolve().parent.parent.parent
+CONFIG_TOML = REPO_DIR / "config.toml"
+RUFF_TOML = REPO_DIR / "ruff.toml"
+GEN_DIR = REPO_DIR / ".generated"
+GEN_CONFIG = GEN_DIR / "oxlint-config.json"
+GEN_PLUGIN = GEN_DIR / "oxlint-plugin.ts"
+PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / "com.lints.sync.plist"
+CRON_TAG = "# lints-sync"
+
+PY_EXTS = {".py", ".pyi"}
+TS_EXTS = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts"}
+SKIP_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    "out",
+}
+PyCheckFn = Callable[[ast.AST, Path], list[tuple[int, int, str]]]
+
+app = typer.Typer(
+    help="Centralised Ruff + Oxlint rules managed via config.toml.", no_args_is_help=False
 )
-from lints.env import ensure_rich_path, get_editor
-from lints.runner import (
-    explain_rule,
-    resolve_oxlint_cmd,
-    resolve_ruff_cmd,
-    run_cmd,
-    run_lint,
-    run_python_ast_rules,
-    run_rule_tests,
-    scaffold_new_rule,
-)
-from lints.sync import (
-    daemon_tick,
-    install_daemon,
-    print_daemon_status,
-    run_bootstrap,
-    run_push,
-    run_status,
-    run_update,
-    scan_scattered_configs,
-    uninstall_daemon,
-)
 
 
-def _match_rules(query: str) -> list[RuleSpec]:
-    return [r for r in discover_rules() if query in {r.rule_id, r.name}]
+class OxlintMeta(BaseModel):
+    plugins: list[str] = []
+    rules: dict[str, object] = {}
+    overrides: list[dict[str, object]] = []
 
 
-def _toggle_rule(query: str, *, enabled: bool, local: bool) -> int:
-    matches = _match_rules(query)
-    if not matches:
-        print(f"error: no rule matching `{query}` (run `lints list`)", file=sys.stderr)
-        return 1
-    if len(matches) > 1 and "/" not in query:
-        ids = ", ".join(m.rule_id for m in matches)
-        print(
-            f"error: `{query}` matches multiple rules ({ids}); specify `<ts|py>/<name>`",
-            file=sys.stderr,
-        )
-        return 1
-
-    target_toml = Path.cwd() / "lints.toml" if local else CONFIG_TOML
-    for spec in matches:
-        set_rule_enabled(spec.lang, spec.name, enabled, target_toml)
-        state = "enabled" if enabled else "disabled"
-        print(f"{state}: {spec.rule_id} (in {target_toml})")
-
-    if not local:
-        build_artifacts()
-    return 0
+class RuffMeta(BaseModel):
+    select: list[str] = []
+    ignore: list[str] = []
+    banned_api: dict[str, str] = Field(default={}, alias="bannedApi")
+    per_file_ignores: dict[str, list[str]] = Field(default={}, alias="perFileIgnores")
 
 
-def cmd_list(_args: argparse.Namespace) -> int:
-    cfg = load_toml_config(CONFIG_TOML)
-    rules = discover_rules(cfg)
-    print(f"Target dir: {cfg.target}   Rules dir: {cfg.rules_dir}   Config: {CONFIG_TOML}\n")
-    for spec in rules:
-        state = "on " if spec.enabled else "off"
-        kind = "ast" if (spec.custom_ts_file or spec.custom_py_file) else "cfg"
-        print(f"  [{state}] {spec.rule_id:<34} ({kind})  {spec.summary}")
-    return 0
+class RuleMeta(BaseModel):
+    summary: str
+    code: str | None = None
+    default_severity: str = Field(default="error", alias="defaultSeverity")
+    oxlint: OxlintMeta = OxlintMeta()
+    ruff: RuffMeta = RuffMeta()
 
 
-def cmd_target(args: argparse.Namespace) -> int:
-    target_toml = Path.cwd() / "lints.toml" if args.local else CONFIG_TOML
-    if not args.directory:
-        cfg = load_toml_config(target_toml if target_toml.exists() else CONFIG_TOML)
-        print(cfg.target)
-        return 0
-    set_lints_setting("target", args.directory, target_toml)
-    print(f"Set default lint target = {args.directory!r} in {target_toml}")
-    return 0
+class LintsSettings(BaseModel):
+    target: str = "."
+    rules_dir: str = "rules"
 
 
-def cmd_rules_dir(args: argparse.Namespace) -> int:
-    set_lints_setting("rules_dir", args.directory, CONFIG_TOML)
-    build_artifacts()
-    print(f"Set rules_dir = {args.directory!r} in {CONFIG_TOML} and rebuilt configs.")
-    return 0
+class ConfigFile(BaseModel):
+    lints: LintsSettings = LintsSettings()
+    ts: dict[str, bool] = {}
+    py: dict[str, bool] = {}
 
 
-def cmd_edit(args: argparse.Namespace) -> int:
-    if args.query == "config" or args.query is None:
-        target = CONFIG_TOML
+@dataclass
+class Rule:
+    lang: str
+    name: str
+    folder: Path
+    enabled: bool
+    meta: RuleMeta
+
+    @property
+    def id(self) -> str:
+        return f"{self.lang}/{self.name}"
+
+    @property
+    def ts_file(self) -> Path | None:
+        p = self.folder / "rule.ts"
+        return p if p.exists() else None
+
+    @property
+    def py_file(self) -> Path | None:
+        p = self.folder / "rule.py"
+        return p if p.exists() else None
+
+
+def _setup_path() -> str:
+    h = str(Path.home())
+    extra = ["/opt/homebrew/bin", "/usr/local/bin", f"{h}/.local/bin", f"{h}/.bun/bin"]
+    merged = list(dict.fromkeys([*extra, *os.environ.get("PATH", "/usr/bin:/bin").split(":")]))
+    os.environ["PATH"] = ":".join(p for p in merged if p)
+    return os.environ["PATH"]
+
+
+def _load_config() -> tuple[ConfigFile, Path | None]:
+    if CONFIG_TOML.exists():
+        base = ConfigFile.model_validate(tomllib.loads(CONFIG_TOML.read_text()))
     else:
-        matches = _match_rules(args.query)
-        if not matches:
-            print(f"error: unknown rule `{args.query}`", file=sys.stderr)
-            return 1
-        spec = matches[0]
-        target = spec.custom_ts_file or spec.custom_py_file or (spec.folder / "rule.json")
-
-    editor = get_editor()
-    if not editor:
-        print(target)
-        return 0
-    return subprocess.run([*editor.split(), str(target)], check=False).returncode
-
-
-def cmd_ruff_check(args: argparse.Namespace) -> int:
-    targets = args.paths or ["."]
-    ruff = resolve_ruff_cmd()
-    rc = run_cmd(
-        [*ruff, "check", "--config", str(CONFIG_TOML.parent / "ruff.toml"), *targets]
-    ).returncode
-    py_files = [Path(p) for p in targets if Path(p).is_file()]
-    ast_rc = run_python_ast_rules(py_files, discover_rules())
-    return 1 if (rc != 0 or ast_rc != 0) else 0
+        base = ConfigFile()
+    for d in [Path.cwd().resolve(), *Path.cwd().resolve().parents]:
+        local = d / "lints.toml"
+        if local.exists() and local != CONFIG_TOML.resolve():
+            loc = ConfigFile.model_validate(tomllib.loads(local.read_text()))
+            merged = ConfigFile(
+                lints=LintsSettings(target=loc.lints.target, rules_dir=base.lints.rules_dir),
+                ts={**base.ts, **loc.ts},
+                py={**base.py, **loc.py},
+            )
+            return merged, local
+    return base, None
 
 
-def cmd_oxlint_check(args: argparse.Namespace) -> int:
-    oxlint = resolve_oxlint_cmd()
-    if oxlint is None:
-        print("error: oxlint not found", file=sys.stderr)
-        return 1
-    targets = args.paths or ["."]
-    return run_cmd(
-        [*oxlint, "-c", str(CONFIG_TOML.parent / "oxlint.config.ts"), *targets]
-    ).returncode
+def _rules(cfg: ConfigFile | None = None) -> list[Rule]:
+    active = cfg or _load_config()[0]
+    root = (REPO_DIR / Path(active.lints.rules_dir).expanduser()).resolve()
+    out: list[Rule] = []
+    for lang, toggles in (("ts", active.ts), ("py", active.py)):
+        if not (root / lang).is_dir():
+            continue
+        for folder in sorted((root / lang).iterdir()):
+            rj = folder / "rule.json"
+            if folder.is_dir() and rj.exists():
+                meta = RuleMeta.model_validate_json(rj.read_text())
+                out.append(Rule(lang, folder.name, folder, toggles.get(folder.name, True), meta))
+    return out
 
 
-def cmd_daemon(args: argparse.Namespace) -> int:
-    if args.action == "tick":
-        return daemon_tick()
-    if args.action == "install":
-        install_daemon()
-        return 0
-    if args.action == "uninstall":
-        uninstall_daemon()
-        return 0
-    print_daemon_status()
-    return 0
+def _oxlint_cmd() -> list[str]:
+    if shutil.which("oxlint"):
+        return ["oxlint"]
+    if shutil.which("bunx"):
+        return ["bunx", "oxlint"]
+    return ["npx", "--yes", "oxlint"]
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="lints",
-        description="Self-contained Ruff + Oxlint rules controlled via config.toml.",
+def _load_py_fn(path: Path) -> PyCheckFn | None:
+    spec = importlib.util.spec_from_file_location(f"rule_{path.parent.name}", path)
+    if not spec or not spec.loader:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    fn = mod.__dict__.get("check")
+    return fn if callable(fn) else None
+
+
+@app.command()
+def build() -> None:
+    """Compile enabled rules from config.toml into ruff.toml and .generated/."""
+    rules = _rules(_load_config()[0])
+    GEN_DIR.mkdir(exist_ok=True)
+
+    plugins = ["typescript", "unicorn", "import", "oxc"]
+    ox_rules: dict[str, object] = {
+        "eqeqeq": ["error", "smart"],
+        "prefer-const": "error",
+        "no-var": "error",
+        "no-eval": "error",
+        "no-empty": ["error", {"allowEmptyCatch": False}],
+        "no-unused-vars": ["error", {"argsIgnorePattern": "^_", "varsIgnorePattern": "^_"}],
+        "typescript/consistent-type-imports": [
+            "error",
+            {"prefer": "type-imports", "fixStyle": "inline-type-imports"},
+        ],
+        "unicorn/prefer-node-protocol": "error",
+        "unicorn/consistent-function-scoping": "off",
+        "import/no-cycle": "error",
+        "import/default": "off",
+    }
+    overrides: list[dict[str, object]] = []
+    imports: list[str] = []
+    entries: list[str] = []
+
+    for r in [x for x in rules if x.lang == "ts" and x.enabled]:
+        plugins.extend(p for p in r.meta.oxlint.plugins if p not in plugins)
+        ox_rules.update(r.meta.oxlint.rules)
+        overrides.extend(r.meta.oxlint.overrides)
+        if r.ts_file:
+            ident = f"r_{len(imports)}"
+            rel = Path("..") / r.ts_file.relative_to(REPO_DIR)
+            imports.append(f'import {{ rule as {ident} }} from "{rel.as_posix()}";')
+            entries.append(f'    "{r.name}": {ident},')
+            if r.meta.default_severity != "off":
+                ox_rules[f"lints/{r.name}"] = r.meta.default_severity
+
+    GEN_PLUGIN.write_text(
+        "\n".join(
+            [*imports, "", 'export default { meta: { name: "lints" }, rules: {', *entries, "}};\n"]
+        ),
     )
-    sub = parser.add_subparsers(dest="command")
-
-    p_lint = sub.add_parser(
-        "lint", aliases=["check"], help="Lint configured target directory (or explicit paths)"
-    )
-    p_lint.add_argument(
-        "paths", nargs="*", help="Optional files or folders (defaults to `target` in config.toml)"
-    )
-    p_lint.set_defaults(func=lambda a: run_lint(a.paths, fix=False))
-
-    p_fix = sub.add_parser("fix", help="Auto-fix & format Python and TypeScript files")
-    p_fix.add_argument("paths", nargs="*", help="Optional files or folders")
-    p_fix.set_defaults(func=lambda a: run_lint(a.paths, fix=True))
-
-    p_list = sub.add_parser("list", help="List all self-contained rules and their enabled state")
-    p_list.set_defaults(func=cmd_list)
-
-    p_en = sub.add_parser(
-        "enable", help="Enable a rule in config.toml (or ./lints.toml with --local)"
-    )
-    p_en.add_argument("rule", help="Rule ID, e.g. `ts/no-nullish-coalescing`")
-    p_en.add_argument(
-        "--local", action="store_true", help="Write override to ./lints.toml in current project"
-    )
-    p_en.set_defaults(func=lambda a: _toggle_rule(a.rule, enabled=True, local=a.local))
-
-    p_dis = sub.add_parser(
-        "disable", help="Disable a rule in config.toml (or ./lints.toml with --local)"
-    )
-    p_dis.add_argument("rule", help="Rule ID, e.g. `ts/no-default-export`")
-    p_dis.add_argument(
-        "--local", action="store_true", help="Write override to ./lints.toml in current project"
-    )
-    p_dis.set_defaults(func=lambda a: _toggle_rule(a.rule, enabled=False, local=a.local))
-
-    p_new = sub.add_parser("new", help="Scaffold a new self-contained rule folder + tests")
-    p_new.add_argument("rule", help="`<ts|py>/<rule-name>`, e.g. `ts/no-date-now`")
-    p_new.add_argument("--summary", default="", help="One-line rule summary")
-    p_new.set_defaults(func=lambda a: scaffold_new_rule(a.rule, a.summary))
-
-    p_test = sub.add_parser("test", help="Run hermetic invalid/valid fixture tests for each rule")
-    p_test.add_argument(
-        "rule", nargs="?", default=None, help="Optional rule ID or `ts` / `py` filter"
-    )
-    p_test.set_defaults(func=lambda a: run_rule_tests(a.rule))
-
-    p_exp = sub.add_parser("explain", help="Print a rule's README + valid/invalid examples")
-    p_exp.add_argument("rule", help="Rule ID or code, e.g. `ts/no-type-assertion` or `PY001`")
-    p_exp.set_defaults(func=lambda a: explain_rule(a.rule))
-
-    p_tgt = sub.add_parser("target", help="Get or set the default folder linted by `lints lint`")
-    p_tgt.add_argument(
-        "directory", nargs="?", default=None, help="Directory path (e.g. `src` or `~/code/app`)"
-    )
-    p_tgt.add_argument(
-        "--local", action="store_true", help="Save target in ./lints.toml for current project"
-    )
-    p_tgt.set_defaults(func=cmd_target)
-
-    p_rdir = sub.add_parser(
-        "rules-dir", help="Set the folder directory containing rule definitions"
-    )
-    p_rdir.add_argument("directory", help="Path to rules directory")
-    p_rdir.set_defaults(func=cmd_rules_dir)
-
-    p_build = sub.add_parser("build", help="Compile enabled rules into ruff.toml and .generated/")
-    p_build.set_defaults(func=lambda _a: build_artifacts() or 0)
-
-    p_edit = sub.add_parser("edit", help="Open config.toml or a specific rule in $EDITOR")
-    p_edit.add_argument(
-        "query", nargs="?", default="config", help="`config` (default) or a rule ID"
-    )
-    p_edit.set_defaults(func=cmd_edit)
-
-    p_push = sub.add_parser("push", help="Run rule tests, build configs, commit, rebase, and push")
-    p_push.add_argument("message", nargs="*", help="Optional commit message")
-    p_push.add_argument("--force", action="store_true", help="Skip rule tests before pushing")
-    p_push.set_defaults(func=lambda a: run_push(a.message, force=a.force))
-
-    p_upd = sub.add_parser("update", aliases=["pull", "sync"], help="Pull latest rules from GitHub")
-    p_upd.add_argument("--tools", action="store_true", help="Also upgrade ruff & oxlint binaries")
-    p_upd.set_defaults(func=lambda a: run_update(upgrade_tools=a.tools))
-
-    p_scan = sub.add_parser("scan", help="Find scattered per-project ruff/oxlint configs")
-    p_scan.add_argument("dir", nargs="?", default=".", help="Directory to scan")
-    p_scan.set_defaults(func=lambda a: scan_scattered_configs(a.dir))
-
-    p_stat = sub.add_parser("status", help="Show git, symlink, tool, and 60s sync status")
-    p_stat.set_defaults(func=lambda _a: run_status())
-
-    p_boot = sub.add_parser("bootstrap", help="Install uv CLI, symlinks, linters, and 60s sync")
-    p_boot.add_argument(
-        "--no-tools", action="store_true", help="Skip installing ruff/oxlint binaries"
-    )
-    p_boot.add_argument("--no-daemon", action="store_true", help="Skip installing 60s sync timer")
-    p_boot.add_argument(
-        "--with-git-hook", action="store_true", help="Enable global Git pre-commit hook"
-    )
-    p_boot.set_defaults(
-        func=lambda a: run_bootstrap(
-            no_tools=a.no_tools,
-            no_daemon=a.no_daemon,
-            with_git_hook=a.with_git_hook,
+    GEN_CONFIG.write_text(
+        json.dumps(
+            {
+                "plugins": plugins,
+                "categories": {"correctness": "error", "suspicious": "warn"},
+                "hasCustomPlugin": bool(entries),
+                "rules": ox_rules,
+                "overrides": overrides,
+                "ignorePatterns": [
+                    "dist/**",
+                    "build/**",
+                    ".next/**",
+                    "out/**",
+                    "node_modules/**",
+                    "rules/**/tests/**",
+                ],
+            },
+            indent=2,
         )
+        + "\n"
     )
 
-    p_daemon = sub.add_parser("daemon", help="Manage the 60-second background sync timer")
-    p_daemon.add_argument("action", choices=["install", "uninstall", "status", "tick"])
-    p_daemon.set_defaults(func=cmd_daemon)
+    select = [
+        "E4",
+        "E7",
+        "E9",
+        "F",
+        "I",
+        "B",
+        "UP",
+        "SIM",
+        "C4",
+        "PIE",
+        "RET",
+        "TID252",
+        "PTH",
+        "PLE",
+        "PERF",
+        "FURB",
+        "RUF",
+    ]
+    ignore = ["E501", "B008", "RET504", "PTH123"]
+    banned: dict[str, dict[str, str]] = {}
+    pfi: dict[str, list[str]] = {}
+    for r in [x for x in rules if x.lang == "py" and x.enabled]:
+        select.extend(c for c in r.meta.ruff.select if c not in select)
+        ignore.extend(c for c in r.meta.ruff.ignore if c not in ignore)
+        banned.update({k: {"msg": v} for k, v in r.meta.ruff.banned_api.items()})
+        for pat, codes in r.meta.ruff.per_file_ignores.items():
+            pfi.setdefault(pat, []).extend(c for c in codes if c not in pfi.get(pat, []))
 
-    p_rc = sub.add_parser("ruff-check")
-    p_rc.add_argument("paths", nargs="*")
-    p_rc.set_defaults(func=cmd_ruff_check)
+    ruff_doc: dict[str, object] = {
+        "line-length": 100,
+        "target-version": "py312",
+        "exclude": [".git", ".venv", "venv", "node_modules", "dist", "build", "rules/**/tests/**"],
+        "lint": {
+            "select": select,
+            "ignore": ignore,
+            "flake8-tidy-imports": {
+                "ban-relative-imports": "parents",
+                **({"banned-api": banned} if banned else {}),
+            },
+            "isort": {"combine-as-imports": True, "force-sort-within-sections": True},
+            **({"per-file-ignores": pfi} if pfi else {}),
+        },
+        "format": {"quote-style": "double", "indent-style": "space"},
+    }
+    RUFF_TOML.write_text(
+        "# Auto-generated by `lints build` from `config.toml`.\n\n" + tomlkit.dumps(ruff_doc)
+    )
 
-    p_oc = sub.add_parser("oxlint-check")
-    p_oc.add_argument("paths", nargs="*")
-    p_oc.set_defaults(func=cmd_oxlint_check)
 
-    return parser
+def _collect_files(targets: list[Path]) -> tuple[list[Path], list[Path]]:
+    py_files: list[Path] = []
+    ts_files: list[Path] = []
+    for t in targets:
+        if t.is_file():
+            if t.suffix in PY_EXTS:
+                py_files.append(t)
+            elif t.suffix in TS_EXTS:
+                ts_files.append(t)
+        elif t.is_dir():
+            for root, dirs, files in os.walk(t):
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                rp = Path(root)
+                if rp.resolve().is_relative_to(REPO_DIR / "rules") and "tests" in rp.parts:
+                    dirs[:] = []
+                    continue
+                for f in files:
+                    fp = rp / f
+                    if fp.suffix in PY_EXTS:
+                        py_files.append(fp)
+                    elif fp.suffix in TS_EXTS:
+                        ts_files.append(fp)
+    return py_files, ts_files
 
 
-def main() -> int:
-    ensure_rich_path()
-    parser = build_parser()
-    args = parser.parse_args()
-    if not args.command:
-        return run_lint([], fix=False)
-    func = args.__dict__.get("func")
-    if callable(func):
-        return int(func(args))
-    return 1
+def _run_lint(paths: list[Path] | None, *, fix: bool) -> None:
+    if not GEN_CONFIG.exists() or not RUFF_TOML.exists():
+        build()
+    cfg, local_path = _load_config()
+    base = local_path.parent if local_path else Path.cwd()
+    targets = paths or [(base / Path(cfg.lints.target).expanduser()).resolve()]
+    py_files, ts_files = _collect_files(targets)
+    if not py_files and not ts_files:
+        typer.echo("No Python or JS/TS files found.")
+        return
+
+    rc = 0
+    str_targets = [str(t) for t in targets]
+    if py_files:
+        ruff = [shutil.which("ruff") or "ruff"]
+        if fix:
+            rc |= subprocess.call(
+                [*ruff, "check", "--fix", "--config", str(RUFF_TOML), *str_targets]
+            )
+            rc |= subprocess.call([*ruff, "format", "--config", str(RUFF_TOML), *str_targets])
+        else:
+            rc |= subprocess.call([*ruff, "check", "--config", str(RUFF_TOML), *str_targets])
+
+        checkers = [
+            (r, r.meta.code or r.name, fn)
+            for r in _rules(cfg)
+            if r.lang == "py" and r.enabled and r.py_file and (fn := _load_py_fn(r.py_file))
+        ]
+        for fp in py_files:
+            src = fp.read_text(errors="ignore")
+            lines = src.splitlines()
+            tree = ast.parse(src, filename=str(fp))
+            for r, code, fn in checkers:
+                for ln, col, msg in fn(tree, fp):
+                    if 1 <= ln <= len(lines) and "# noqa" in lines[ln - 1]:
+                        continue
+                    typer.echo(f"{fp}:{ln}:{col}: {code} [{r.id}] {msg}")
+                    rc = 1
+
+    if ts_files:
+        flags = ["--fix"] if fix else []
+        rc |= subprocess.call(
+            [*_oxlint_cmd(), *flags, "-c", str(REPO_DIR / "oxlint.config.ts"), *str_targets]
+        )
+
+    if rc != 0:
+        raise typer.Exit(1)
+
+
+@app.callback(invoke_without_command=True)
+def default_cmd(ctx: typer.Context) -> None:
+    _setup_path()
+    if ctx.invoked_subcommand is None:
+        _run_lint(None, fix=False)
+
+
+@app.command()
+def lint(paths: list[Path] | None = typer.Argument(None)) -> None:
+    """Lint configured target folder (or explicit paths)."""
+    _run_lint(paths, fix=False)
+
+
+@app.command()
+def fix(paths: list[Path] | None = typer.Argument(None)) -> None:
+    """Auto-fix and format Python and TypeScript files."""
+    _run_lint(paths, fix=True)
+
+
+@app.command("list")
+def list_rules() -> None:
+    """List all self-contained rules and their enabled state."""
+    cfg, _ = _load_config()
+    typer.echo(f"target = {cfg.lints.target!r}   rules_dir = {cfg.lints.rules_dir!r}\n")
+    for r in _rules(cfg):
+        kind = "ast" if (r.ts_file or r.py_file) else "cfg"
+        typer.echo(f"  [{'on ' if r.enabled else 'off'}] {r.id:<32} ({kind})  {r.meta.summary}")
+
+
+def _set_toggle(query: str, *, value: bool, local: bool) -> None:
+    matches = [r for r in _rules() if query in {r.id, r.name}]
+    if not matches or (len(matches) > 1 and "/" not in query):
+        typer.echo(
+            f"Specify an exact rule ID from `lints list` (matched: {[m.id for m in matches]})",
+            err=True,
+        )
+        raise typer.Exit(1)
+    path = Path.cwd() / "lints.toml" if local else CONFIG_TOML
+    doc = tomlkit.parse(path.read_text()) if path.exists() else tomlkit.document()
+    r = matches[0]
+    if r.lang not in doc:
+        doc[r.lang] = tomlkit.table()
+    doc[r.lang][r.name] = value  # type: ignore[index]
+    path.write_text(tomlkit.dumps(doc))
+    if not local:
+        build()
+    typer.echo(f"{'enabled' if value else 'disabled'} {r.id} in {path}")
+
+
+@app.command()
+def enable(rule: str, local: bool = typer.Option(False, "--local")) -> None:
+    """Enable a rule in config.toml (or ./lints.toml with --local)."""
+    _set_toggle(rule, value=True, local=local)
+
+
+@app.command()
+def disable(rule: str, local: bool = typer.Option(False, "--local")) -> None:
+    """Disable a rule in config.toml (or ./lints.toml with --local)."""
+    _set_toggle(rule, value=False, local=local)
+
+
+@app.command()
+def target(
+    directory: str | None = typer.Argument(None), local: bool = typer.Option(False, "--local")
+) -> None:
+    """Get or set the default folder linted by `lints lint`."""
+    path = Path.cwd() / "lints.toml" if local else CONFIG_TOML
+    if directory is None:
+        typer.echo(_load_config()[0].lints.target)
+        return
+    doc = tomlkit.parse(path.read_text()) if path.exists() else tomlkit.document()
+    if "lints" not in doc:
+        doc["lints"] = tomlkit.table()
+    doc["lints"]["target"] = directory  # type: ignore[index]
+    path.write_text(tomlkit.dumps(doc))
+    typer.echo(f"Set target = {directory!r} in {path}")
+
+
+@app.command()
+def explain(rule: str) -> None:
+    """Print a rule's README and valid/invalid test fixtures."""
+    matches = [r for r in _rules() if rule in {r.id, r.name, r.meta.code}]
+    if not matches:
+        raise typer.BadParameter(f"Unknown rule `{rule}`")
+    for r in matches:
+        typer.echo((r.folder / "README.md").read_text().rstrip())
+        for fp in sorted((r.folder / "tests").rglob("*")):
+            if fp.is_file():
+                typer.echo(f"\n### {fp.relative_to(r.folder)}\n```\n{fp.read_text().rstrip()}\n```")
+
+
+@app.command()
+def new(rule: str, summary: str = typer.Option("Enforce custom convention.", "--summary")) -> None:
+    """Scaffold a new self-contained rule folder with tests."""
+    lang, _, name = rule.partition("/")
+    if lang not in {"ts", "py"} or not name:
+        raise typer.BadParameter("Expected `<ts|py>/<rule-name>`, e.g. `ts/no-date-now`")
+    folder = REPO_DIR / _load_config()[0].lints.rules_dir / lang / name
+    (folder / "tests").mkdir(parents=True, exist_ok=False)
+    (folder / "README.md").write_text(
+        f"# `{rule}`\n\n## Why\n{summary}\n\n## How to Fix\nSee `tests/valid.{lang}`.\n"
+    )
+    if lang == "ts":
+        (folder / "rule.json").write_text(json.dumps({"summary": summary}, indent=2) + "\n")
+        (folder / "rule.ts").write_text(
+            'import { type RuleDefinition } from "../types.ts";\n\n'
+            f'export const rule: RuleDefinition = {{\n  meta: {{ type: "problem", docs: {{ description: {json.dumps(summary)} }} }},\n'
+            '  create(ctx) {\n    return {\n      Identifier(node) {\n        if (node.name === "FORBIDDEN_EXAMPLE") '
+            f'ctx.report({{ node, message: "Forbidden. Docs: `lints explain {rule}`." }});\n      }},\n    }};\n  }},\n}};\n'
+        )
+        (folder / "tests/invalid.ts").write_text("export const FORBIDDEN_EXAMPLE = 1;\n")
+        (folder / "tests/valid.ts").write_text("export const ok = 1;\n")
+    else:
+        code = f"PY9{len(_rules()):02d}"
+        (folder / "rule.json").write_text(
+            json.dumps({"code": code, "summary": summary}, indent=2) + "\n"
+        )
+        (folder / "rule.py").write_text(
+            "from __future__ import annotations\nimport ast\nfrom pathlib import Path\n\n"
+            "def check(tree: ast.AST, _path: Path) -> list[tuple[int, int, str]]:\n"
+            f'    return [(n.lineno, n.col_offset + 1, "Forbidden. Docs: `lints explain {rule}`.") '
+            'for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id == "FORBIDDEN_EXAMPLE"]\n'
+        )
+        (folder / "tests/invalid.py").write_text("FORBIDDEN_EXAMPLE = 1\n")
+        (folder / "tests/valid.py").write_text("OK = 1\n")
+    _set_toggle(rule, value=True, local=False)
+
+
+def _cases(tests_dir: Path, kind: str) -> list[tuple[Path, Path]]:
+    sub = tests_dir / kind
+    from_dir: list[tuple[Path, Path]] = []
+    if sub.is_dir():
+        from_dir = [(f, f.relative_to(sub)) for f in sorted(sub.rglob("*")) if f.is_file()]
+    direct = [(f, Path(f.name)) for f in sorted(tests_dir.glob(f"{kind}*")) if f.is_file()]
+    return [*from_dir, *direct]
+
+
+class TestResult(BaseModel):
+    rule_id: str
+    ok: bool
+    detail: str
+
+
+def _test_one(r: Rule) -> TestResult:
+    inv, val = _cases(r.folder / "tests", "invalid"), _cases(r.folder / "tests", "valid")
+    with tempfile.TemporaryDirectory() as tmp:
+        td = Path(tmp)
+        if r.lang == "ts":
+            rules = dict(r.meta.oxlint.rules)
+            js_plugins: list[str] = []
+            if r.ts_file:
+                plug = td / "plugin.ts"
+                plug.write_text(
+                    f'import {{ rule }} from "{r.ts_file.as_posix()}";\n'
+                    f'export default {{ meta: {{ name: "lints" }}, rules: {{ "{r.name}": rule }} }};\n'
+                )
+                js_plugins.append(plug.as_posix())
+                if r.meta.default_severity != "off":
+                    rules[f"lints/{r.name}"] = r.meta.default_severity
+            cfg = td / "oxlint.config.ts"
+            cfg.write_text(
+                "export default "
+                + json.dumps(
+                    {
+                        "plugins": r.meta.oxlint.plugins,
+                        "categories": {"correctness": "off", "suspicious": "off"},
+                        "jsPlugins": js_plugins,
+                        "rules": rules,
+                        "overrides": r.meta.oxlint.overrides,
+                    }
+                )
+            )
+            ox = _oxlint_cmd()
+            for kind, cases, expect_fail in (("invalid", inv, True), ("valid", val, False)):
+                for src, rel in cases:
+                    dest = td / kind / "src" / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest)
+                    res = subprocess.run(
+                        [*ox, "-c", str(cfg), str(dest)],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if (res.returncode != 0) != expect_fail:
+                        return TestResult(
+                            rule_id=r.id, ok=False, detail=f"{kind} `{src.name}` unexpected result"
+                        )
+        else:
+            rcfg = td / "ruff.toml"
+            if r.meta.ruff.select:
+                rcfg.write_text(
+                    tomlkit.dumps(
+                        {
+                            "lint": {
+                                "select": r.meta.ruff.select,
+                                "ignore": r.meta.ruff.ignore,
+                                "per-file-ignores": r.meta.ruff.per_file_ignores,
+                                "flake8-tidy-imports": {
+                                    "banned-api": {
+                                        k: {"msg": v} for k, v in r.meta.ruff.banned_api.items()
+                                    }
+                                },
+                            }
+                        }
+                    )
+                )
+            fn = _load_py_fn(r.py_file) if r.py_file else None
+            for kind, cases, expect_fail in (("invalid", inv, True), ("valid", val, False)):
+                for src, rel in cases:
+                    dest = td / kind / "src" / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest)
+                    failed = False
+                    if r.meta.ruff.select:
+                        res = subprocess.run(
+                            ["ruff", "check", "--config", str(rcfg), str(dest)],
+                            capture_output=True,
+                            check=False,
+                        )
+                        failed = res.returncode != 0
+                    if fn and fn(ast.parse(dest.read_text()), Path("src") / rel):
+                        failed = True
+                    if failed != expect_fail:
+                        return TestResult(
+                            rule_id=r.id, ok=False, detail=f"{kind} `{src.name}` unexpected result"
+                        )
+    return TestResult(rule_id=r.id, ok=True, detail=f"{len(inv)} invalid + {len(val)} valid ok")
+
+
+@app.command("test")
+def run_tests(rule: str | None = typer.Argument(None)) -> None:
+    """Run hermetic invalid/valid fixture tests per rule."""
+    selected = [r for r in _rules() if rule is None or rule in {r.id, r.name, r.lang}]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(_test_one, selected))
+    for res in results:
+        typer.echo(f"  [{'PASS' if res.ok else 'FAIL'}] {res.rule_id:<32} {res.detail}")
+    if not all(res.ok for res in results):
+        raise typer.Exit(1)
+
+
+@app.command()
+def update() -> None:
+    """Pull latest rules from GitHub and rebuild configs."""
+    subprocess.run(["git", "pull", "--rebase", "--autostash", "--quiet"], cwd=REPO_DIR, check=True)
+    build()
+
+
+@app.command()
+def push(message: str = typer.Argument(""), force: bool = typer.Option(False, "--force")) -> None:
+    """Test rules, rebuild configs, commit, rebase, and push to GitHub."""
+    build()
+    if not force:
+        run_tests(None)
+    if subprocess.check_output(["git", "status", "--porcelain"], cwd=REPO_DIR, text=True).strip():
+        subprocess.run(["git", "add", "-A"], cwd=REPO_DIR, check=True)
+        msg = message or f"chore: update lints ({socket.gethostname().split('.')[0]})"
+        subprocess.run(["git", "commit", "-m", msg], cwd=REPO_DIR, check=True)
+    update()
+    subprocess.run(["git", "push", "-u", "origin", "HEAD"], cwd=REPO_DIR, check=True)
+
+
+@app.command()
+def bootstrap(with_git_hook: bool = typer.Option(False, "--with-git-hook")) -> None:
+    """Link central configs, install uv/oxlint tools, and start 60s auto-pull."""
+    rich_path = _setup_path()
+    build()
+    for link, target_file in (
+        (Path.home() / ".config/ruff/ruff.toml", RUFF_TOML),
+        (Path.home() / "oxlint.config.ts", REPO_DIR / "oxlint.config.ts"),
+    ):
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.unlink(missing_ok=True)
+        link.symlink_to(target_file)
+        typer.echo(f"Linked {link} -> {target_file}")
+
+    subprocess.run(["uv", "tool", "install", "--force", "--editable", str(REPO_DIR)], check=True)
+    if not shutil.which("ruff"):
+        subprocess.run(["uv", "tool", "install", "ruff"], check=True)
+    if not shutil.which("oxlint") and shutil.which("bun"):
+        subprocess.run(["bun", "install", "-g", "oxlint"], check=True)
+    if with_git_hook:
+        subprocess.run(
+            ["git", "config", "--global", "core.hooksPath", str(REPO_DIR / "hooks")], check=True
+        )
+
+    uv_bin = shutil.which("uv") or "uv"
+    sync_cmd = [uv_bin, "run", "--quiet", "--project", str(REPO_DIR), "lints", "update"]
+    if platform.system() == "Darwin":
+        PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PLIST_PATH.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": "com.lints.sync",
+                    "ProgramArguments": sync_cmd,
+                    "StartInterval": 60,
+                    "RunAtLoad": True,
+                    "EnvironmentVariables": {"PATH": rich_path, "HOME": str(Path.home())},
+                }
+            )
+        )
+        subprocess.run(
+            ["launchctl", "bootout", f"gui/{os.getuid()}", str(PLIST_PATH)],
+            capture_output=True,
+            check=False,
+        )
+        subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(PLIST_PATH)], check=False
+        )
+    elif shutil.which("crontab"):
+        cur = subprocess.run(
+            ["crontab", "-l"], capture_output=True, text=True, check=False
+        ).stdout.splitlines()
+        lines = [ln for ln in cur if CRON_TAG not in ln]
+        lines.append(f"* * * * * PATH={rich_path} {' '.join(sync_cmd)} {CRON_TAG}")
+        subprocess.run(["crontab", "-"], input="\n".join(lines) + "\n", text=True, check=True)
+    typer.echo("Bootstrap complete!")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    app()
