@@ -87,8 +87,30 @@ def test_enable_disable_target_and_list_with_config_flag(tmp_path: Path) -> None
     assert (REPO_DIR / "config.toml").read_text() == central_before
 
 
-def test_stray_lints_toml_is_ignored_without_config_flag(tmp_path: Path) -> None:
-    """A stray ./lints.toml in cwd does not implicitly override central config.toml."""
+def test_git_repo_root_lints_toml_is_auto_detected(tmp_path: Path) -> None:
+    """A lints.toml at the root of a Git repo is auto-applied without passing --config."""
+    repo_dir = tmp_path / "my_repo"
+    sub_dir = repo_dir / "src" / "nested"
+    sub_dir.mkdir(parents=True)
+    subprocess.run(["git", "init", "--quiet", str(repo_dir)], check=True)
+    (repo_dir / "lints.toml").write_text(
+        '[lints]\ntarget = "src"\n[py]\nno-blind-except = false\nno-getattr = false\n'
+        "[ts]\nno-default-export = false\n"
+    )
+    app_py = sub_dir / "app.py"
+    app_py.write_text(BAD_PY)
+    widget_ts = sub_dir / "widget.ts"
+    widget_ts.write_text("export default function demo(): number {\n  return 1;\n}\n")
+
+    assert _run_lints("target", cwd=sub_dir).stdout.strip() == "src"
+    res_cwd = _run_lints("lint", cwd=sub_dir)
+    assert res_cwd.returncode == 0, res_cwd.stdout + res_cwd.stderr
+    res_explicit = _run_lints("lint", str(app_py), str(widget_ts))
+    assert res_explicit.returncode == 0, res_explicit.stdout + res_explicit.stderr
+
+
+def test_stray_lints_toml_outside_git_repo_is_ignored_without_config_flag(tmp_path: Path) -> None:
+    """A stray ./lints.toml in a non-Git folder does not override central config.toml."""
     (tmp_path / "lints.toml").write_text(
         '[lints]\ntarget = "custom_dir"\n[py]\nno-blind-except = false\nno-getattr = false\n'
     )

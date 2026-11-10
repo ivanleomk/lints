@@ -3,7 +3,7 @@
 
 [lints]
 # Default folder directory linted when running `lints lint` with no arguments.
-# Pass `--config <path>` to use a custom config file instead of this default.
+# Git repos with a root `lints.toml` (or an explicit `--config <path>`) override this default.
 target = "."
 ignore = [".git", ".venv", "venv", "__pycache__", "node_modules", "dist", "build", ".next", "out"]
 rules_dir = "rules"
