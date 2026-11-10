@@ -780,16 +780,23 @@ def _filter_claude_codex_entries(entries: list[object], marker: str) -> list[obj
     return [e for e in entries if marker not in json.dumps(e)]
 
 
+class HookAction(StrEnum):
+    INSTALL = "install"
+    UNINSTALL = "uninstall"
+    STOP = "stop"
+    PRE_INVOCATION = "pre-invocation"
+
+
 @app.command()
 def hook(
-    action: str = typer.Argument(..., help="install | uninstall | stop | pre-invocation"),
+    action: HookAction = typer.Argument(..., help="install | uninstall | stop | pre-invocation"),
     agent: HookAgent = typer.Option(..., "--agent", "-a", help="Target agent or harness"),
     local: bool = typer.Option(False, "--local", help="Install in current repo instead of global"),
 ) -> None:
     """Install or run pre-turn-end lint & checklist hooks (`--agent antigravity|claude|codex|git`)."""
     bin_cmd = str(REPO_DIR / "bin/lints")
 
-    if action == "stop":
+    if action == HookAction.STOP:
         raw = sys.stdin.read().strip()
         payload = json.loads(raw) if raw else {}
         if agent == HookAgent.ANTIGRAVITY:
@@ -817,7 +824,7 @@ def hook(
             sys.stdout.write(json.dumps({"decision": "block", "reason": reason}) + "\n")
         return
 
-    if action == "pre-invocation":
+    if action == HookAction.PRE_INVOCATION:
         raw = sys.stdin.read().strip()
         payload = json.loads(raw) if raw else {}
         text = _render_checklists()
@@ -835,17 +842,19 @@ def hook(
             sys.stdout.write(msg + "\n")
         return
 
+    verb = "Installed" if action == HookAction.INSTALL else "Uninstalled"
+
     if agent == HookAgent.GIT:
         if local:
             dest = Path.cwd() / ".git/hooks/pre-commit"
-            if action == "uninstall":
+            if action == HookAction.UNINSTALL:
                 dest.unlink(missing_ok=True)
                 typer.echo(f"Removed {dest}")
             else:
                 dest.unlink(missing_ok=True)
                 dest.symlink_to(REPO_DIR / "hooks/pre-commit")
                 typer.echo(f"Linked {dest} -> {REPO_DIR / 'hooks/pre-commit'}")
-        elif action == "uninstall":
+        elif action == HookAction.UNINSTALL:
             subprocess.run(["git", "config", "--global", "--unset", "core.hooksPath"], check=False)
             typer.echo("Unset global git core.hooksPath")
         else:
@@ -862,9 +871,9 @@ def hook(
             hooks_file = Path.home() / ".gemini/config/hooks.json"
         hooks_file.parent.mkdir(parents=True, exist_ok=True)
         data: dict[str, object] = json.loads(hooks_file.read_text()) if hooks_file.exists() else {}
-        if action == "uninstall":
+        if action == HookAction.UNINSTALL:
             data.pop("lints", None)
-        elif action == "install":
+        else:
             data["lints"] = {
                 "PreInvocation": [
                     {
@@ -881,10 +890,8 @@ def hook(
                     }
                 ],
             }
-        else:
-            raise typer.BadParameter(f"Unknown hook action `{action}`")
         hooks_file.write_text(json.dumps(data, indent=2) + "\n")
-        typer.echo(f"{action.title()}ed Antigravity hooks in {hooks_file}")
+        typer.echo(f"{verb} Antigravity hooks in {hooks_file}")
         return
 
     start_entry = {
@@ -915,9 +922,9 @@ def hook(
                 cleaned = _filter_claude_codex_entries(
                     cur_list if isinstance(cur_list, list) else [], bin_cmd
                 )
-                hooks_map[ev] = [*cleaned, entry] if action == "install" else cleaned
+                hooks_map[ev] = [*cleaned, entry] if action == HookAction.INSTALL else cleaned
         cfg_file.write_text(json.dumps(root, indent=2) + "\n")
-        typer.echo(f"{action.title()}ed Claude Code hooks in {cfg_file}")
+        typer.echo(f"{verb} Claude Code hooks in {cfg_file}")
         return
 
     # HookAgent.CODEX
@@ -929,9 +936,9 @@ def hook(
         cleaned = _filter_claude_codex_entries(
             cur_list if isinstance(cur_list, list) else [], bin_cmd
         )
-        codex_root[ev] = [*cleaned, entry] if action == "install" else cleaned
+        codex_root[ev] = [*cleaned, entry] if action == HookAction.INSTALL else cleaned
     cfg_file.write_text(json.dumps(codex_root, indent=2) + "\n")
-    typer.echo(f"{action.title()}ed Codex hooks in {cfg_file}")
+    typer.echo(f"{verb} Codex hooks in {cfg_file}")
 
 
 @app.command()
