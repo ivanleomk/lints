@@ -329,16 +329,16 @@ def _run_lint(paths: list[Path] | None, *, fix: bool) -> None:
         return
 
     rc = 0
-    str_targets = [str(t) for t in targets]
     if py_files:
+        py_targets = [str(p) for p in py_files]
         ruff = [shutil.which("ruff") or "ruff"]
         if fix:
             rc |= subprocess.call(
-                [*ruff, "check", "--fix", "--config", str(RUFF_TOML), *str_targets]
+                [*ruff, "check", "--fix", "--config", str(RUFF_TOML), *py_targets]
             )
-            rc |= subprocess.call([*ruff, "format", "--config", str(RUFF_TOML), *str_targets])
+            rc |= subprocess.call([*ruff, "format", "--config", str(RUFF_TOML), *py_targets])
         else:
-            rc |= subprocess.call([*ruff, "check", "--config", str(RUFF_TOML), *str_targets])
+            rc |= subprocess.call([*ruff, "check", "--config", str(RUFF_TOML), *py_targets])
 
         checkers = [
             (r, r.meta.code or r.name, fn)
@@ -358,8 +358,9 @@ def _run_lint(paths: list[Path] | None, *, fix: bool) -> None:
 
     if ts_files:
         flags = ["--fix"] if fix else []
+        ts_targets = [str(p) for p in ts_files]
         rc |= subprocess.call(
-            [*_oxlint_cmd(), *flags, "-c", str(REPO_DIR / "oxlint.config.ts"), *str_targets]
+            [*_oxlint_cmd(), *flags, "-c", str(REPO_DIR / "oxlint.config.ts"), *ts_targets]
         )
 
     if rc != 0:
