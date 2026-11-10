@@ -348,7 +348,11 @@ def _run_lint(paths: list[Path] | None, *, fix: bool) -> None:
         for fp in py_files:
             src = fp.read_text(errors="ignore")
             lines = src.splitlines()
-            tree = ast.parse(src, filename=str(fp))
+            try:
+                tree = ast.parse(src, filename=str(fp))
+            except SyntaxError:
+                rc = 1
+                continue
             for r, code, fn in checkers:
                 for ln, col, msg in fn(tree, fp):
                     if 1 <= ln <= len(lines) and "# noqa" in lines[ln - 1]:
