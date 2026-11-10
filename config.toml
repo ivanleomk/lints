@@ -1,4 +1,4 @@
-# Central `lints` configuration (`lints edit` opens this file)
+# Central `lints` configuration (managed via `lints enable` / `lints disable` / `lints target`)
 # Synced across machines via `lints sync` / `lints propose` / `lints merge`.
 
 [lints]

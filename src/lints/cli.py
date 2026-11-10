@@ -27,6 +27,8 @@ from pydantic import BaseModel, Field
 import tomlkit
 import typer
 
+from lints.noqa import is_noqa_suppressed
+
 REPO_DIR = Path(__file__).resolve().parent.parent.parent
 CONFIG_TOML = REPO_DIR / "config.toml"
 RUFF_TOML = REPO_DIR / "ruff.toml"
@@ -274,6 +276,7 @@ def _compile_configs(
     ignore = ["E501", "B008", "RET504", "PTH123"]
     banned: dict[str, dict[str, str]] = {}
     pfi: dict[str, list[str]] = {}
+    external = sorted({r.meta.code for r in rules if r.lang == "py" and r.meta.code})
     for r in [x for x in rules if x.lang == "py" and x.enabled]:
         select.extend(c for c in r.meta.ruff.select if c not in select)
         ignore.extend(c for c in r.meta.ruff.ignore if c not in ignore)
@@ -288,6 +291,7 @@ def _compile_configs(
         "lint": {
             "select": select,
             "ignore": ignore,
+            **({"external": external} if external else {}),
             "flake8-tidy-imports": {
                 "ban-relative-imports": "parents",
                 **({"banned-api": banned} if banned else {}),
@@ -435,7 +439,11 @@ def _run_lint(paths: list[Path] | None, *, fix: bool, config: Path | None = None
                 continue
             for r, code, fn in checkers:
                 for ln, col, msg in fn(tree, fp):
-                    if 1 <= ln <= len(lines) and "# noqa" in lines[ln - 1]:
+                    if (
+                        1 <= ln <= len(lines)
+                        and "#" in lines[ln - 1]
+                        and is_noqa_suppressed(src, ln, code, r.id)
+                    ):
                         continue
                     typer.echo(f"{fp}:{ln}:{col}: {code} [{r.id}] {msg}")
                     rc = 1
@@ -718,16 +726,12 @@ def checklist(config: Path | None = CONFIG_OPTION) -> None:
     typer.echo(_render_checklists(_load_config(config)[0]))
 
 
-def _current_branch() -> str:
-    return subprocess.check_output(
-        ["git", "symbolic-ref", "--short", "HEAD"], cwd=REPO_DIR, text=True
-    ).strip()
-
-
 @app.command()
 def sync(background: bool = typer.Option(False, "--background", hidden=True)) -> None:
     """Pull latest merged rules on main and rebuild configs."""
-    branch = _current_branch()
+    branch = subprocess.check_output(
+        ["git", "symbolic-ref", "--short", "HEAD"], cwd=REPO_DIR, text=True
+    ).strip()
     dirty = bool(
         subprocess.check_output(["git", "status", "--porcelain"], cwd=REPO_DIR, text=True).strip()
     )
@@ -759,17 +763,18 @@ def propose(
     pr_title = title or f"chore: propose lint updates ({host})"
     slug = re.sub(r"[^a-z0-9]+", "-", pr_title.lower()).strip("-")[:36] or "update"
 
-    if _current_branch() == "main":
+    branch = subprocess.check_output(
+        ["git", "symbolic-ref", "--short", "HEAD"], cwd=REPO_DIR, text=True
+    ).strip()
+    if branch == "main":
         stamp = dt.datetime.now().strftime("%m%d-%H%M")
-        subprocess.run(
-            ["git", "checkout", "-b", f"propose/{slug}-{stamp}"], cwd=REPO_DIR, check=True
-        )
+        branch = f"propose/{slug}-{stamp}"
+        subprocess.run(["git", "checkout", "-b", branch], cwd=REPO_DIR, check=True)
 
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=REPO_DIR, text=True).strip():
         subprocess.run(["git", "add", "-A"], cwd=REPO_DIR, check=True)
         subprocess.run(["git", "commit", "-m", pr_title], cwd=REPO_DIR, check=True)
 
-    branch = _current_branch()
     subprocess.run(["git", "push", "-u", "origin", branch], cwd=REPO_DIR, check=True)
 
     existing = subprocess.run(
@@ -793,7 +798,10 @@ def propose(
 def merge(pr: str | None = typer.Argument(None)) -> None:
     """Squash-merge a proposed PR (defaults to current or latest open PR) and sync main."""
     target_pr = pr
-    if not target_pr and _current_branch() == "main":
+    cur_branch = subprocess.check_output(
+        ["git", "symbolic-ref", "--short", "HEAD"], cwd=REPO_DIR, text=True
+    ).strip()
+    if not target_pr and cur_branch == "main":
         listed = subprocess.check_output(
             [
                 "gh",
@@ -816,7 +824,10 @@ def merge(pr: str | None = typer.Argument(None)) -> None:
 
     cmd = ["gh", "pr", "merge", *([target_pr] if target_pr else []), "--squash", "--delete-branch"]
     subprocess.run(cmd, cwd=REPO_DIR, check=True)
-    if _current_branch() != "main":
+    after_branch = subprocess.check_output(
+        ["git", "symbolic-ref", "--short", "HEAD"], cwd=REPO_DIR, text=True
+    ).strip()
+    if after_branch != "main":
         subprocess.run(["git", "checkout", "main"], cwd=REPO_DIR, check=True)
     sync(background=False)
 

@@ -7,6 +7,7 @@ exclude = [".git", ".venv", "venv", "__pycache__", "node_modules", "dist", "buil
 [lint]
 select = ["E4", "E7", "E9", "F", "I", "B", "UP", "SIM", "C4", "PIE", "RET", "TID252", "PTH", "PLE", "PERF", "FURB", "RUF", "BLE001", "E722", "B009", "TID251", "PLC0415", "PT"]
 ignore = ["E501", "B008", "RET504", "PTH123", "SIM108"]
+external = ["PY001", "PY002", "PY003", "PY004", "PY005", "PY006"]
 
 [lint.flake8-tidy-imports]
 ban-relative-imports = "parents"
