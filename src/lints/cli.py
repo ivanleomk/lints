@@ -38,7 +38,7 @@ CRON_TAG = "# lints-sync"
 
 PY_EXTS = {".py", ".pyi"}
 TS_EXTS = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts"}
-SKIP_DIRS = {
+DEFAULT_IGNORE = [
     ".git",
     ".venv",
     "venv",
@@ -48,7 +48,7 @@ SKIP_DIRS = {
     "build",
     ".next",
     "out",
-}
+]
 PyCheckFn = Callable[[ast.AST, Path], list[tuple[int, int, str]]]
 CONFIG_OPTION = typer.Option(
     None,
@@ -85,6 +85,7 @@ class RuleMeta(BaseModel):
 
 class LintsSettings(BaseModel):
     target: str = "."
+    ignore: list[str] = Field(default_factory=lambda: list(DEFAULT_IGNORE))
     rules_dir: str = "rules"
     checklists_dir: str = "checklists"
 
@@ -225,11 +226,7 @@ def _compile_configs(
         "rules": ox_rules,
         "overrides": overrides,
         "ignorePatterns": [
-            "dist/**",
-            "build/**",
-            ".next/**",
-            "out/**",
-            "node_modules/**",
+            *(f"{p.rstrip('/')}/**" for p in cfg.lints.ignore),
             "rules/**/tests/**",
         ],
     }
@@ -268,7 +265,7 @@ def _compile_configs(
     ruff_doc: dict[str, object] = {
         "line-length": 100,
         "target-version": "py312",
-        "exclude": [".git", ".venv", "venv", "node_modules", "dist", "build", "rules/**/tests/**"],
+        "exclude": [*cfg.lints.ignore, "rules/**/tests/**"],
         "lint": {
             "select": select,
             "ignore": ignore,
@@ -302,19 +299,48 @@ def build() -> None:
     )
 
 
-def _collect_files(targets: list[Path]) -> tuple[list[Path], list[Path]]:
+def _is_ignored_rel(rel_parts: tuple[str, ...], ignore: list[str]) -> bool:
+    for raw in ignore:
+        if not (pat := tuple(Path(raw.strip("/")).parts)):
+            continue
+        if (len(pat) == 1 and pat[0] in rel_parts) or any(
+            rel_parts[i : i + len(pat)] == pat for i in range(len(rel_parts) - len(pat) + 1)
+        ):
+            return True
+    return False
+
+
+def _collect_files(
+    targets: list[Path], ignore: list[str] = DEFAULT_IGNORE, base_dir: Path | None = None
+) -> tuple[list[Path], list[Path]]:
     py_files: list[Path] = []
     ts_files: list[Path] = []
+    base_res = base_dir.resolve() if base_dir else None
     for t in targets:
         if t.is_file():
+            tf = t.resolve()
+            if (
+                base_res
+                and tf.is_relative_to(base_res)
+                and _is_ignored_rel(tf.parent.relative_to(base_res).parts, ignore)
+            ):
+                continue
             if t.suffix in PY_EXTS:
                 py_files.append(t)
             elif t.suffix in TS_EXTS:
                 ts_files.append(t)
         elif t.is_dir():
-            for root, dirs, files in os.walk(t):
-                dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            t_root = t.resolve()
+            rel_root = base_res if (base_res and t_root.is_relative_to(base_res)) else t_root
+            if rel_root != t_root and _is_ignored_rel(t_root.relative_to(rel_root).parts, ignore):
+                continue
+            for root, dirs, files in os.walk(t_root):
                 rp = Path(root)
+                dirs[:] = [
+                    d
+                    for d in dirs
+                    if not _is_ignored_rel((rp / d).relative_to(rel_root).parts, ignore)
+                ]
                 if rp.resolve().is_relative_to(REPO_DIR / "rules") and "tests" in rp.parts:
                     dirs[:] = []
                     continue
@@ -356,7 +382,7 @@ def _run_lint(paths: list[Path] | None, *, fix: bool, config: Path | None = None
         build()
     base = config_path.parent if config_path else Path.cwd()
     targets = paths or [(base / Path(cfg.lints.target).expanduser()).resolve()]
-    py_files, ts_files = _collect_files(targets)
+    py_files, ts_files = _collect_files(targets, ignore=cfg.lints.ignore, base_dir=base)
     if not py_files and not ts_files:
         typer.echo("No Python or JS/TS files found.")
         return

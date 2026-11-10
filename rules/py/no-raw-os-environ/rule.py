@@ -5,14 +5,44 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-ALLOWED_FILENAMES = {"env.py", "config.py", "settings.py", "conftest.py", "cli.py"}
-ALLOWED_DIRS = {"scripts", "tests", "test", "bin"}
+from pydantic import BaseModel, Field
+
+ROOT_MARKERS = (".git", "pyproject.toml")
+
+
+class _BoundaryConfig(BaseModel):
+    allowed_dirs: frozenset[str] = Field(alias="allowedDirs")
+    allowed_files: frozenset[str] = Field(alias="allowedFiles")
+
+
+_CONFIG = _BoundaryConfig.model_validate_json(Path(__file__).with_name("rule.json").read_text())
+
+
+def _find_project_root(path: Path) -> Path | None:
+    for parent in path.parents:
+        if any((parent / marker).exists() for marker in ROOT_MARKERS):
+            return parent
+    return None
+
+
+def _project_dir_parts(path: Path) -> tuple[str, ...]:
+    if not path.is_absolute() and not path.exists():
+        return path.parts[:-1]
+    resolved = path.resolve()
+    root = _find_project_root(resolved)
+    if root is not None:
+        return resolved.relative_to(root).parts[:-1]
+    if not path.is_absolute():
+        return path.parts[:-1]
+    if resolved.parent != resolved:
+        return (resolved.parent.name,)
+    return ()
 
 
 def _is_boundary_file(path: Path) -> bool:
-    if path.name in ALLOWED_FILENAMES or path.name.startswith("test_"):
+    if path.name in _CONFIG.allowed_files or path.name.startswith("test_"):
         return True
-    return any(part in ALLOWED_DIRS for part in path.parts)
+    return any(part in _CONFIG.allowed_dirs for part in _project_dir_parts(path))
 
 
 def check(tree: ast.AST, path: Path) -> list[tuple[int, int, str]]:
