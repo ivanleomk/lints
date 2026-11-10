@@ -10,4 +10,4 @@ Inspired by [Factory's *Using Linters to Direct Agents*](https://factory.ai/news
    * Run `uv run lints new ts/<name> --summary "..."` or `uv run lints new py/<name> --summary "..."`.
    * Implement the check in `rule.ts` (TypeScript) or `rule.py` / `rule.json` (Python). Ensure error messages state **what** is banned, **Fix:** how to rewrite it, and **Docs:** `lints explain <lang>/<name>`.
    * Add concrete failing and passing examples in `tests/invalid*` and `tests/valid*`.
-   * Verify hermetically with `uv run lints test <lang>/<name>` before running `lints push`.
+   * Verify hermetically with `uv run lints test <lang>/<name>` before running `lints propose`.

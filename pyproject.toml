@@ -20,3 +20,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lints"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[tool.ty.src]
+exclude = ["rules/**/tests/**"]
