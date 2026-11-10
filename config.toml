@@ -3,7 +3,7 @@
 
 [lints]
 # Default folder directory linted when running `lints lint` with no arguments.
-# Individual projects can also drop a local `lints.toml` to set their own `target` or rule overrides.
+# Pass `--config <path>` to use a custom config file instead of this default.
 target = "."
 rules_dir = "rules"
 checklists_dir = "checklists"

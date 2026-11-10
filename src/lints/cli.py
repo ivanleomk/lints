@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 import datetime as dt
 from enum import StrEnum
@@ -49,6 +50,12 @@ SKIP_DIRS = {
     "out",
 }
 PyCheckFn = Callable[[ast.AST, Path], list[tuple[int, int, str]]]
+CONFIG_OPTION = typer.Option(
+    None,
+    "--config",
+    "-c",
+    help="Path to a config TOML file that overrides the default config.toml.",
+)
 
 app = typer.Typer(
     help="Centralised Ruff + Oxlint rules managed via config.toml.", no_args_is_help=False
@@ -120,27 +127,15 @@ def _setup_path() -> str:
     return os.environ["PATH"]
 
 
-def _load_config() -> tuple[ConfigFile, Path | None]:
+def _load_config(config: Path | None = None) -> tuple[ConfigFile, Path | None]:
+    if config is not None:
+        resolved = config.expanduser().resolve()
+        if not resolved.is_file():
+            raise typer.BadParameter(f"Config file not found: {config}", param_hint="'--config'")
+        return ConfigFile.model_validate(tomllib.loads(resolved.read_text())), resolved
     if CONFIG_TOML.exists():
-        base = ConfigFile.model_validate(tomllib.loads(CONFIG_TOML.read_text()))
-    else:
-        base = ConfigFile()
-    for d in [Path.cwd().resolve(), *Path.cwd().resolve().parents]:
-        local = d / "lints.toml"
-        if local.exists() and local != CONFIG_TOML.resolve():
-            loc = ConfigFile.model_validate(tomllib.loads(local.read_text()))
-            merged = ConfigFile(
-                lints=LintsSettings(
-                    target=loc.lints.target,
-                    rules_dir=base.lints.rules_dir,
-                    checklists_dir=base.lints.checklists_dir,
-                ),
-                checklists={**base.checklists, **loc.checklists},
-                ts={**base.ts, **loc.ts},
-                py={**base.py, **loc.py},
-            )
-            return merged, local
-    return base, None
+        return ConfigFile.model_validate(tomllib.loads(CONFIG_TOML.read_text())), None
+    return ConfigFile(), None
 
 
 def _rules(cfg: ConfigFile | None = None) -> list[Rule]:
@@ -176,12 +171,15 @@ def _load_py_fn(path: Path) -> PyCheckFn | None:
     return fn if callable(fn) else None
 
 
-@app.command()
-def build() -> None:
-    """Compile enabled rules from config.toml into ruff.toml and .generated/."""
-    rules = _rules(_load_config()[0])
-    GEN_DIR.mkdir(exist_ok=True)
-
+def _compile_configs(
+    cfg: ConfigFile,
+    rules: list[Rule],
+    *,
+    plugin_path: Path,
+    oxlint_json_path: Path | None,
+    ruff_path: Path,
+    relative_to_repo: bool,
+) -> dict[str, object]:
     plugins = ["typescript", "unicorn", "import", "oxc"]
     ox_rules: dict[str, object] = {
         "eqeqeq": ["error", "smart"],
@@ -209,38 +207,34 @@ def build() -> None:
         overrides.extend(r.meta.oxlint.overrides)
         if r.ts_file:
             ident = f"r_{len(imports)}"
-            rel = Path("..") / r.ts_file.relative_to(REPO_DIR)
+            rel = (Path("..") / r.ts_file.relative_to(REPO_DIR)) if relative_to_repo else r.ts_file
             imports.append(f'import {{ rule as {ident} }} from "{rel.as_posix()}";')
             entries.append(f'    "{r.name}": {ident},')
             if r.meta.default_severity != "off":
                 ox_rules[f"lints/{r.name}"] = r.meta.default_severity
 
-    GEN_PLUGIN.write_text(
+    plugin_path.write_text(
         "\n".join(
             [*imports, "", 'export default { meta: { name: "lints" }, rules: {', *entries, "}};\n"]
         ),
     )
-    GEN_CONFIG.write_text(
-        json.dumps(
-            {
-                "plugins": plugins,
-                "categories": {"correctness": "error", "suspicious": "warn"},
-                "hasCustomPlugin": bool(entries),
-                "rules": ox_rules,
-                "overrides": overrides,
-                "ignorePatterns": [
-                    "dist/**",
-                    "build/**",
-                    ".next/**",
-                    "out/**",
-                    "node_modules/**",
-                    "rules/**/tests/**",
-                ],
-            },
-            indent=2,
-        )
-        + "\n"
-    )
+    ox_doc: dict[str, object] = {
+        "plugins": plugins,
+        "categories": {"correctness": "error", "suspicious": "warn"},
+        "hasCustomPlugin": bool(entries),
+        "rules": ox_rules,
+        "overrides": overrides,
+        "ignorePatterns": [
+            "dist/**",
+            "build/**",
+            ".next/**",
+            "out/**",
+            "node_modules/**",
+            "rules/**/tests/**",
+        ],
+    }
+    if oxlint_json_path is not None:
+        oxlint_json_path.write_text(json.dumps(ox_doc, indent=2) + "\n")
 
     select = [
         "E4",
@@ -287,8 +281,24 @@ def build() -> None:
         },
         "format": {"quote-style": "double", "indent-style": "space"},
     }
-    RUFF_TOML.write_text(
+    ruff_path.write_text(
         "# Auto-generated by `lints build` from `config.toml`.\n\n" + tomlkit.dumps(ruff_doc)
+    )
+    return ox_doc
+
+
+@app.command()
+def build() -> None:
+    """Compile enabled rules from config.toml into ruff.toml and .generated/."""
+    cfg, _ = _load_config()
+    GEN_DIR.mkdir(exist_ok=True)
+    _compile_configs(
+        cfg,
+        _rules(cfg),
+        plugin_path=GEN_PLUGIN,
+        oxlint_json_path=GEN_CONFIG,
+        ruff_path=RUFF_TOML,
+        relative_to_repo=True,
     )
 
 
@@ -317,32 +327,57 @@ def _collect_files(targets: list[Path]) -> tuple[list[Path], list[Path]]:
     return py_files, ts_files
 
 
-def _run_lint(paths: list[Path] | None, *, fix: bool) -> None:
-    if not GEN_CONFIG.exists() or not RUFF_TOML.exists():
+@contextmanager
+def _linter_configs(
+    cfg: ConfigFile, rules: list[Rule], *, custom: bool
+) -> Generator[tuple[Path, Path]]:
+    if not custom:
+        yield RUFF_TOML, REPO_DIR / "oxlint.config.ts"
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        td = Path(tmp)
+        rcfg, plug, ocfg = td / "ruff.toml", td / "oxlint-plugin.ts", td / "oxlint.config.ts"
+        ox_doc = _compile_configs(
+            cfg,
+            rules,
+            plugin_path=plug,
+            oxlint_json_path=None,
+            ruff_path=rcfg,
+            relative_to_repo=False,
+        )
+        js_plugins = [plug.as_posix()] if ox_doc.pop("hasCustomPlugin", False) else []
+        ocfg.write_text(f"export default {json.dumps({**ox_doc, 'jsPlugins': js_plugins})};\n")
+        yield rcfg, ocfg
+
+
+def _run_lint(paths: list[Path] | None, *, fix: bool, config: Path | None = None) -> None:
+    cfg, config_path = _load_config(config)
+    if config_path is None and (not GEN_CONFIG.exists() or not RUFF_TOML.exists()):
         build()
-    cfg, local_path = _load_config()
-    base = local_path.parent if local_path else Path.cwd()
+    base = config_path.parent if config_path else Path.cwd()
     targets = paths or [(base / Path(cfg.lints.target).expanduser()).resolve()]
     py_files, ts_files = _collect_files(targets)
     if not py_files and not ts_files:
         typer.echo("No Python or JS/TS files found.")
         return
 
+    rules = _rules(cfg)
     rc = 0
     if py_files:
         py_targets = [str(p) for p in py_files]
         ruff = [shutil.which("ruff") or "ruff"]
-        if fix:
-            rc |= subprocess.call(
-                [*ruff, "check", "--fix", "--config", str(RUFF_TOML), *py_targets]
-            )
-            rc |= subprocess.call([*ruff, "format", "--config", str(RUFF_TOML), *py_targets])
-        else:
-            rc |= subprocess.call([*ruff, "check", "--config", str(RUFF_TOML), *py_targets])
+        with _linter_configs(cfg, rules, custom=config_path is not None) as (ruff_cfg, _):
+            if fix:
+                rc |= subprocess.call(
+                    [*ruff, "check", "--fix", "--config", str(ruff_cfg), *py_targets]
+                )
+                rc |= subprocess.call([*ruff, "format", "--config", str(ruff_cfg), *py_targets])
+            else:
+                rc |= subprocess.call([*ruff, "check", "--config", str(ruff_cfg), *py_targets])
 
         checkers = [
             (r, r.meta.code or r.name, fn)
-            for r in _rules(cfg)
+            for r in rules
             if r.lang == "py" and r.enabled and r.py_file and (fn := _load_py_fn(r.py_file))
         ]
         for fp in py_files:
@@ -363,44 +398,49 @@ def _run_lint(paths: list[Path] | None, *, fix: bool) -> None:
     if ts_files:
         flags = ["--fix"] if fix else []
         ts_targets = [str(p) for p in ts_files]
-        rc |= subprocess.call(
-            [*_oxlint_cmd(), *flags, "-c", str(REPO_DIR / "oxlint.config.ts"), *ts_targets]
-        )
+        with _linter_configs(cfg, rules, custom=config_path is not None) as (_, oxlint_cfg):
+            rc |= subprocess.call([*_oxlint_cmd(), *flags, "-c", str(oxlint_cfg), *ts_targets])
 
     if rc != 0:
         raise typer.Exit(1)
 
 
 @app.callback(invoke_without_command=True)
-def default_cmd(ctx: typer.Context) -> None:
+def default_cmd(ctx: typer.Context, config: Path | None = CONFIG_OPTION) -> None:
     _setup_path()
     if ctx.invoked_subcommand is None:
-        _run_lint(None, fix=False)
+        _run_lint(None, fix=False, config=config)
 
 
 @app.command()
-def lint(paths: list[Path] | None = typer.Argument(None)) -> None:
+def lint(
+    paths: list[Path] | None = typer.Argument(None),
+    config: Path | None = CONFIG_OPTION,
+) -> None:
     """Lint configured target folder (or explicit paths)."""
-    _run_lint(paths, fix=False)
+    _run_lint(paths, fix=False, config=config)
 
 
 @app.command()
-def fix(paths: list[Path] | None = typer.Argument(None)) -> None:
+def fix(
+    paths: list[Path] | None = typer.Argument(None),
+    config: Path | None = CONFIG_OPTION,
+) -> None:
     """Auto-fix and format Python and TypeScript files."""
-    _run_lint(paths, fix=True)
+    _run_lint(paths, fix=True, config=config)
 
 
 @app.command("list")
-def list_rules() -> None:
+def list_rules(config: Path | None = CONFIG_OPTION) -> None:
     """List all self-contained rules and their enabled state."""
-    cfg, _ = _load_config()
+    cfg, _ = _load_config(config)
     typer.echo(f"target = {cfg.lints.target!r}   rules_dir = {cfg.lints.rules_dir!r}\n")
     for r in _rules(cfg):
         kind = "ast" if (r.ts_file or r.py_file) else "cfg"
         typer.echo(f"  [{'on ' if r.enabled else 'off'}] {r.id:<32} ({kind})  {r.meta.summary}")
 
 
-def _set_toggle(query: str, *, value: bool, local: bool) -> None:
+def _set_toggle(query: str, *, value: bool, config: Path | None = None) -> None:
     matches = [r for r in _rules() if query in {r.id, r.name}]
     if not matches or (len(matches) > 1 and "/" not in query):
         typer.echo(
@@ -408,39 +448,40 @@ def _set_toggle(query: str, *, value: bool, local: bool) -> None:
             err=True,
         )
         raise typer.Exit(1)
-    path = Path.cwd() / "lints.toml" if local else CONFIG_TOML
+    path = config.expanduser().resolve() if config is not None else CONFIG_TOML
     doc = tomlkit.parse(path.read_text()) if path.exists() else tomlkit.document()
     r = matches[0]
     if r.lang not in doc:
         doc[r.lang] = tomlkit.table()
     doc[r.lang][r.name] = value  # type: ignore[index]
     path.write_text(tomlkit.dumps(doc))
-    if not local:
+    if path == CONFIG_TOML:
         build()
     typer.echo(f"{'enabled' if value else 'disabled'} {r.id} in {path}")
 
 
 @app.command()
-def enable(rule: str, local: bool = typer.Option(False, "--local")) -> None:
-    """Enable a rule in config.toml (or ./lints.toml with --local)."""
-    _set_toggle(rule, value=True, local=local)
+def enable(rule: str, config: Path | None = CONFIG_OPTION) -> None:
+    """Enable a rule in config.toml (or a standalone config via --config)."""
+    _set_toggle(rule, value=True, config=config)
 
 
 @app.command()
-def disable(rule: str, local: bool = typer.Option(False, "--local")) -> None:
-    """Disable a rule in config.toml (or ./lints.toml with --local)."""
-    _set_toggle(rule, value=False, local=local)
+def disable(rule: str, config: Path | None = CONFIG_OPTION) -> None:
+    """Disable a rule in config.toml (or a standalone config via --config)."""
+    _set_toggle(rule, value=False, config=config)
 
 
 @app.command()
 def target(
-    directory: str | None = typer.Argument(None), local: bool = typer.Option(False, "--local")
+    directory: str | None = typer.Argument(None),
+    config: Path | None = CONFIG_OPTION,
 ) -> None:
     """Get or set the default folder linted by `lints lint`."""
-    path = Path.cwd() / "lints.toml" if local else CONFIG_TOML
     if directory is None:
-        typer.echo(_load_config()[0].lints.target)
+        typer.echo(_load_config(config)[0].lints.target)
         return
+    path = config.expanduser().resolve() if config is not None else CONFIG_TOML
     doc = tomlkit.parse(path.read_text()) if path.exists() else tomlkit.document()
     if "lints" not in doc:
         doc["lints"] = tomlkit.table()
@@ -496,7 +537,7 @@ def new(rule: str, summary: str = typer.Option("Enforce custom convention.", "--
         )
         (folder / "tests/invalid.py").write_text("FORBIDDEN_EXAMPLE = 1\n")
         (folder / "tests/valid.py").write_text("OK = 1\n")
-    _set_toggle(rule, value=True, local=False)
+    _set_toggle(rule, value=True, config=None)
 
 
 def _cases(tests_dir: Path, kind: str) -> list[tuple[Path, Path]]:
@@ -627,9 +668,9 @@ def _render_checklists(cfg: ConfigFile | None = None) -> str:
 
 
 @app.command()
-def checklist() -> None:
+def checklist(config: Path | None = CONFIG_OPTION) -> None:
     """Print enabled model self-check lists from checklists/."""
-    typer.echo(_render_checklists())
+    typer.echo(_render_checklists(_load_config(config)[0]))
 
 
 def _current_branch() -> str:
