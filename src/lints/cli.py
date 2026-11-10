@@ -737,7 +737,7 @@ def _dirty_code_files(workspaces: list[str]) -> list[str]:
         if not ws_path.is_dir():
             continue
         res = subprocess.run(
-            ["git", "status", "--porcelain"],
+            ["git", "status", "--porcelain", "-z", "-uall"],
             cwd=ws_path,
             capture_output=True,
             text=True,
@@ -745,10 +745,16 @@ def _dirty_code_files(workspaces: list[str]) -> list[str]:
         )
         if res.returncode != 0:
             continue
-        for line in res.stdout.splitlines():
-            if len(line) < 4:
+        entries = res.stdout.split("\0")
+        idx = 0
+        while idx < len(entries):
+            entry = entries[idx]
+            idx += 1
+            if len(entry) < 4:
                 continue
-            rel = line[3:].split(" -> ")[-1].strip().strip('"')
+            status, rel = entry[:2], entry[3:]
+            if "R" in status or "C" in status:
+                idx += 1
             fp = (ws_path / rel).resolve()
             if fp.is_file() and (fp.suffix in PY_EXTS or fp.suffix in TS_EXTS):
                 dirty.append(str(fp))
