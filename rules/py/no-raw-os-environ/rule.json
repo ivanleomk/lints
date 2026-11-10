@@ -1,4 +1,6 @@
 {
   "code": "PY004",
-  "summary": "Ban raw `os.environ` / `os.getenv` outside `env.py`, `config.py`, `settings.py`, `scripts/`, and `tests/`."
+  "summary": "Ban raw `os.environ` / `os.getenv` outside `env.py`, `config.py`, `settings.py`, `scripts/`, and `tests/`.",
+  "allowedDirs": ["scripts", "tests", "test", "bin"],
+  "allowedFiles": ["env.py", "config.py", "settings.py", "conftest.py", "cli.py"]
 }

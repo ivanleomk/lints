@@ -5,6 +5,7 @@
 # Default folder directory linted when running `lints lint` with no arguments.
 # Pass `--config <path>` to use a custom config file instead of this default.
 target = "."
+ignore = [".git", ".venv", "venv", "__pycache__", "node_modules", "dist", "build", ".next", "out"]
 rules_dir = "rules"
 checklists_dir = "checklists"
 
