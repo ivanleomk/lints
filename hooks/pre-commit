@@ -1,9 +1,19 @@
 #!/usr/bin/env sh
 set -eu
 
-HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-staged=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(py|pyi|js|jsx|ts|tsx|mjs|mts)$' || true)
+src=$0
+while [ -L "$src" ]; do
+  dir=$(CDPATH= cd -- "$(dirname -- "$src")" && pwd -P)
+  target=$(readlink "$src")
+  case $target in
+    /*) src=$target ;;
+    *) src="$dir/$target" ;;
+  esac
+done
+HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$src")" && pwd -P)
 
-if [ -n "$staged" ]; then
-  printf '%s\n' "$staged" | tr '\n' '\0' | xargs -0 "$HOOK_DIR/../bin/lints" lint
+set -- ':(top)*.py' ':(top)*.pyi' ':(top)*.js' ':(top)*.jsx' ':(top)*.ts' ':(top)*.tsx' ':(top)*.mjs' ':(top)*.mts'
+if ! git diff --cached --quiet --diff-filter=ACMR -- "$@"; then
+  cd "$(git rev-parse --show-toplevel)"
+  git diff --cached --name-only -z --diff-filter=ACMR -- "$@" | xargs -0 "$HOOK_DIR/../bin/lints" lint
 fi
