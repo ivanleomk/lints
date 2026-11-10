@@ -128,12 +128,31 @@ def _setup_path() -> str:
     return os.environ["PATH"]
 
 
-def _load_config(config: Path | None = None) -> tuple[ConfigFile, Path | None]:
+def _find_repo_config(start: Path | None = None) -> Path | None:
+    anchor = (start or Path.cwd()).expanduser().resolve()
+    cur = anchor if anchor.is_dir() else anchor.parent
+    for d in (cur, *cur.parents):
+        if (d / ".git").exists():
+            candidate = d / "lints.toml"
+            if candidate.is_file() and candidate != CONFIG_TOML.resolve():
+                return candidate
+            return None
+    return None
+
+
+def _load_config(
+    config: Path | None = None,
+    *,
+    start: Path | None = None,
+    auto_detect: bool = True,
+) -> tuple[ConfigFile, Path | None]:
     if config is not None:
         resolved = config.expanduser().resolve()
         if not resolved.is_file():
             raise typer.BadParameter(f"Config file not found: {config}", param_hint="'--config'")
         return ConfigFile.model_validate(tomllib.loads(resolved.read_text())), resolved
+    if auto_detect and (repo_cfg := _find_repo_config(start)) is not None:
+        return ConfigFile.model_validate(tomllib.loads(repo_cfg.read_text())), repo_cfg
     if CONFIG_TOML.exists():
         return ConfigFile.model_validate(tomllib.loads(CONFIG_TOML.read_text())), None
     return ConfigFile(), None
@@ -287,7 +306,7 @@ def _compile_configs(
 @app.command()
 def build() -> None:
     """Compile enabled rules from config.toml into ruff.toml and .generated/."""
-    cfg, _ = _load_config()
+    cfg, _ = _load_config(auto_detect=False)
     GEN_DIR.mkdir(exist_ok=True)
     _compile_configs(
         cfg,
@@ -377,7 +396,7 @@ def _linter_configs(
 
 
 def _run_lint(paths: list[Path] | None, *, fix: bool, config: Path | None = None) -> None:
-    cfg, config_path = _load_config(config)
+    cfg, config_path = _load_config(config, start=paths[0] if paths else None)
     if config_path is None and (not GEN_CONFIG.exists() or not RUFF_TOML.exists()):
         build()
     base = config_path.parent if config_path else Path.cwd()
